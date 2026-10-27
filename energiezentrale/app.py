@@ -14,7 +14,7 @@ DEFAULT={'plant_name':'Meine Energiezentrale','sensors':{
 'inverter_output':{'label':'Wechselrichter-Ausgangsleistung','entity_id':'sensor.sofar_speicher_active_power_output_total','unit':'W'},
 'pv_forecast':{'label':'PV-Prognose','entity_id':'sensor.solcast_pv_forecast_prognose_heute','unit':'Wh'}},
 'consumers':[{'id':'heater','name':'Elektroheizung','type':'heater','enabled':True,'nominal_power_w':30000,'stages_w':[7500,15000,22500,30000],'priority':1},{'id':'compressor','name':'Kompressor','type':'motor','enabled':True,'nominal_power_w':11000,'stages_w':[],'priority':2}],
-'control_entities':{'mode':'select.sofar_speicher_inverter_energy_storage_mode','grid_setpoint':'number.sofar_speicher_inverter_passive_desired_grid_power','charge_power':'number.sofar_speicher_inverter_passive_maximum_battery_power','discharge_power':'number.sofar_speicher_inverter_passive_minimum_battery_power','apply_button':'button.sofar_speicher_inverter_passive_update_battery_charge_discharge'},'settings':{'grid_import_limit_w':5000,'battery_reserve_percent':25,'inverter_count':2,'control_enabled':False,'mode':'observe','grid_setpoint_sign':'unverified'}}
+'control_entities':{'mode':'select.sofar_speicher_inverter_energy_storage_mode','grid_setpoint':'number.sofar_speicher_inverter_passive_desired_grid_power','charge_power':'number.sofar_speicher_inverter_passive_maximum_battery_power','discharge_power':'number.sofar_speicher_inverter_passive_minimum_battery_power','apply_button':'button.sofar_speicher_inverter_passive_update_battery_charge_discharge'},'settings':{'grid_import_limit_w':5000,'battery_reserve_percent':25,'inverter_count':2,'control_enabled':False,'mode':'observe','grid_setpoint_sign':'unverified','grid_import_sign':'unverified','morning_start_hour':5,'morning_end_hour':9,'learning_days':14}}
 def config():
  if not CFG.exists(): CFG.write_text(json.dumps(DEFAULT,ensure_ascii=False,indent=2))
  try:
@@ -76,6 +76,9 @@ def config_page():
    c['settings']['inverter_count']=max(1,min(10,int(request.form.get('inverter_count','2'))))
    c['settings']['control_enabled']=False
    c['settings']['mode']='observe'
+   c['settings']['morning_start_hour']=max(0,min(23,int(request.form.get('morning_start_hour','5'))))
+   c['settings']['morning_end_hour']=max(1,min(24,int(request.form.get('morning_end_hour','9'))))
+   c['settings']['grid_import_sign']=request.form.get('grid_import_sign','unverified') if request.form.get('grid_import_sign','unverified') in ('positive','negative','unverified') else 'unverified'
   except ValueError:flash('Grenzwerte müssen Zahlen sein.','error');return render_template('config.html',cfg=c,states=entities,ha_error=err)
   save(c);flash('Konfiguration gespeichert. Es wurden keine Geräte geschaltet.','success');entities,err=states();return render_template('config.html',cfg=c,states=entities,ha_error=err)
  return render_template('config.html',cfg=c,states=entities,ha_error=err)
@@ -97,15 +100,38 @@ def consumers():
  return render_template('consumers.html',cfg=c)
 @app.route('/learning')
 def learning():
- rows=[]
- if HIST.exists():
-  try:rows=[json.loads(x) for x in HIST.read_text().splitlines()[-288:] if x.strip()]
-  except Exception:pass
- stats={}
- for k in ['pv_power','load_power','grid_power','battery_soc']:
-  vals=[r.get('values',{}).get(k) for r in rows];vals=[float(v) for v in vals if isinstance(v,(int,float))]
-  stats[k]={'count':len(vals),'average':round(statistics.mean(vals),1) if vals else None,'min':round(min(vals),1) if vals else None,'max':round(max(vals),1) if vals else None}
- return render_template('learning.html',stats=stats,count=len(rows),history_file=str(HIST))
+    rows=[]
+    if HIST.exists():
+        try: rows=[json.loads(x) for x in HIST.read_text().splitlines()[-100000:] if x.strip()]
+        except Exception: rows=[]
+    now=datetime.now(timezone.utc)
+    days=int(config().get('settings',{}).get('learning_days',14))
+    cutoff=now.timestamp()-days*86400
+    recent=[]
+    for r in rows:
+        try:
+            ts=datetime.fromisoformat(r.get('timestamp','').replace('Z','+00:00')).timestamp()
+            if ts>=cutoff: recent.append((ts,r))
+        except Exception: pass
+    stats={}
+    for k in ['pv_power','load_power','grid_power','battery_soc','battery_power']:
+        vals=[r.get('values',{}).get(k) for _,r in recent]
+        vals=[float(v) for v in vals if isinstance(v,(int,float))]
+        stats[k]={'count':len(vals),'average':round(statistics.mean(vals),1) if vals else None,'min':round(min(vals),1) if vals else None,'max':round(max(vals),1) if vals else None}
+    c=config(); st=c.get('settings',{}); sign=st.get('grid_import_sign','unverified')
+    morning=[]
+    for ts,r in recent:
+        dt=datetime.fromtimestamp(ts).astimezone()
+        if int(st.get('morning_start_hour',5)) <= dt.hour < int(st.get('morning_end_hour',9)):
+            v=r.get('values',{}).get('grid_power')
+            if isinstance(v,(int,float)):
+                import_w=float(v) if sign=='positive' else (-float(v) if sign=='negative' else None)
+                if import_w is not None: morning.append({'day':dt.date().isoformat(),'hour':dt.hour,'grid_import_w':max(0,import_w)})
+    daily={}
+    for x in morning: daily[x['day']]=max(daily.get(x['day'],0),x['grid_import_w'])
+    learned_peak=round(statistics.median(daily.values()),0) if len(daily)>=3 else None
+    return render_template('learning.html',cfg=c,stats=stats,count=len(recent),history_file=str(HIST),days=days,
+        morning_count=len(daily),morning_peak=learned_peak,grid_import_sign=sign,daily_peaks=daily)
 
 @app.route('/api/plan')
 def api_plan():
@@ -126,9 +152,12 @@ def api_plan():
         item=snap.get('values',{}).get(k)
         if not item or item.get('value') is None: quality.append(k)
     advice=[]
+    consumers=sorted([x for x in c.get('consumers',[]) if x.get('enabled')], key=lambda x:int(x.get('priority',99)))
     if surplus is not None:
         if surplus > 500:
-            advice.append({'type':'surplus','message':f'Geschätzter PV-Überschuss: {surplus:.0f} W. Verbraucher können nach Priorität geprüft werden.'})
+            available=[x for x in consumers if int(x.get('nominal_power_w',0)) <= surplus]
+            names=', '.join(x.get('name','Verbraucher') for x in available[:3])
+            advice.append({'type':'surplus','message':f'Geschätzter PV-Überschuss: {surplus:.0f} W.' + (f' Nach Nennleistung passend: {names}.' if names else ' Kein aktivierter Verbraucher passt mit seiner Nennleistung vollständig in den geschätzten Überschuss.')})
         elif surplus < -500:
             advice.append({'type':'deficit','message':f'PV liegt etwa {abs(surplus):.0f} W unter dem Hausverbrauch.'})
         else:

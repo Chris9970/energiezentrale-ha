@@ -1,25 +1,21 @@
-# Energiezentrale 0.1.0
+# Energiezentrale 0.3.0
 
-Früher Prototyp einer lokalen Energieübersicht für Home Assistant OS.
+Home Assistant Add-on mit lokalem Dashboard, konfigurierbaren Sensoren und Verbraucher-Stammdaten.
 
-- Deutsche Weboberfläche
-- Live-Auslesen von Home-Assistant-Entitäten
-- Sensorzuordnung über Vorschlagsliste und manuelle Entity-ID
-- Anlagen- und Verbraucher-Konfiguration
-- Lokale Messwerthistorie und einfache Kennzahlen
-- Keine Geräte-Schaltbefehle
+## In 0.3.0 umgesetzt
+- Persistente Konfiguration in `/data/config.json`.
+- Home-Assistant-Entity-IDs für Messwerte und SolaX-Modbus-Steuerungsentitäten frei konfigurierbar.
+- Konfigurierbares Messintervall über Add-on-Option `sample_interval_seconds` (Standard 15 s).
+- Messwerthistorie in `/data/history.jsonl` mit Größenbegrenzung.
+- Statistik über vorhandene historische Messwerte.
+- Historische morgendliche Netzbezugs-Spitzen: täglicher Höchstwert und Median, nur wenn das Vorzeichen des Netzleistungssensors ausdrücklich konfiguriert und mindestens drei Tage Daten vorhanden sind.
+- Beratender Plan-Endpunkt `/api/plan`, der PV minus Last, weiches Netzbezugsziel und passende Verbraucher nach Nennleistung anzeigt.
+- Keine Steuerbefehle werden gesendet. Aktive Steuerung ist absichtlich gesperrt.
 
-Die Lernseite sammelt Daten und berechnet einfache Statistiken; sie ist noch kein selbstlernender Optimierer. Vor produktivem Einsatz müssen Installation, Datenqualität, Vorzeichen/Einheiten, Ausfallsicherheit, Backup/Restore und Sicherheitsgrenzen geprüft werden.
+## Noch nicht umgesetzt
+- Keine autonome Optimierung, kein ML-Modell und keine automatischen Batterie-Sollwerte.
+- Keine Schaltung von Verbrauchern.
+- Keine aktive Steuerung der Wechselrichter.
+- Keine Garantie für vollständige Kompatibilität mit jedem Home-Assistant-/Ingress-Setup ohne Test auf dem Zielsystem.
 
-
-## Version 0.1.4
-- Dunkles Dashboard und aktive Navigation.
-- Read-only: keine Schaltbefehle an Geräte.
-- Konfiguration, Verbraucher und lokale Messwerthistorie bleiben verfügbar.
-- Hinweis: Lernen ist derzeit eine lokale Datensammlung mit Kennzahlen, noch kein autonomer Optimierer.
-
-
-## Update 0.2.0 – Steuerungsvorbereitung
-Diese Version setzt das persistente weiche Netzbezugsziel standardmäßig auf 5000 W, speichert die Anzahl parallel geregelter Wechselrichter (Standard 2) und bietet editierbare Felder für die SolaX-Modbus-Steuerungs-Entitäten. Die bestehende Steuerung ist weiterhin absichtlich gesperrt: Es werden keine Schreibbefehle an den Wechselrichter gesendet, bis Vorzeichen und Registersemantik vor Ort sicher geprüft sind. Die Dashboard-Messwerte und die einfache lokale Historie bleiben enthalten.
-
-Noch nicht enthalten: ein aktiver Optimierer, automatische Batterie-/Netzleistungsregelung, Verbraucher-Schaltlogik, Prognose-Lernmodell oder ein vollständig getesteter Produktionsbetrieb.
+Vor einer Steuerungsfreigabe müssen Registersemantik, Vorzeichen, Einheiten, Skalierung beider Wechselrichter und Fehlerverhalten an der realen Anlage verifiziert werden.
