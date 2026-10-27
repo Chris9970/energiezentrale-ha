@@ -12,7 +12,7 @@ Früher Prototyp einer lokalen Energieübersicht für Home Assistant OS.
 Die Lernseite sammelt Daten und berechnet einfache Statistiken; sie ist noch kein selbstlernender Optimierer. Vor produktivem Einsatz müssen Installation, Datenqualität, Vorzeichen/Einheiten, Ausfallsicherheit, Backup/Restore und Sicherheitsgrenzen geprüft werden.
 
 
-## Version 0.1.3
+## Version 0.1.4
 - Dunkles Dashboard und aktive Navigation.
 - Read-only: keine Schaltbefehle an Geräte.
 - Konfiguration, Verbraucher und lokale Messwerthistorie bleiben verfügbar.

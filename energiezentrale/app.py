@@ -66,7 +66,7 @@ def config_page():
    if val:v['entity_id']=val
   try:c['settings']['grid_import_limit_w']=max(0,int(request.form.get('grid_import_limit_w','30000')));c['settings']['battery_reserve_percent']=max(0,min(100,int(request.form.get('battery_reserve_percent','25'))))
   except ValueError:flash('Grenzwerte müssen Zahlen sein.','error');return render_template('config.html',cfg=c,states=entities,ha_error=err)
-  save(c);flash('Konfiguration gespeichert. Es wurden keine Geräte geschaltet.','success');return redirect(url_for('config_page'))
+  save(c);flash('Konfiguration gespeichert. Es wurden keine Geräte geschaltet.','success');entities,err=states();return render_template('config.html',cfg=c,states=entities,ha_error=err)
  return render_template('config.html',cfg=c,states=entities,ha_error=err)
 @app.route('/consumers',methods=['GET','POST'])
 def consumers():
@@ -82,7 +82,7 @@ def consumers():
    try:p=max(0,int(request.form.get('new_power','0')))
    except ValueError:p=0
    c['consumers'].append({'id':'consumer_'+str(int(time.time())),'name':name,'type':'custom','enabled':True,'nominal_power_w':p,'stages_w':[],'priority':3})
-  save(c);flash('Verbraucher gespeichert. Steuerung bleibt deaktiviert.','success');return redirect(url_for('consumers'))
+  save(c);flash('Verbraucher gespeichert. Steuerung bleibt deaktiviert.','success');return render_template('consumers.html',cfg=c)
  return render_template('consumers.html',cfg=c)
 @app.route('/learning')
 def learning():
