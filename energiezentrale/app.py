@@ -14,13 +14,16 @@ DEFAULT={'plant_name':'Meine Energiezentrale','sensors':{
 'inverter_output':{'label':'Wechselrichter-Ausgangsleistung','entity_id':'sensor.sofar_speicher_active_power_output_total','unit':'W'},
 'pv_forecast':{'label':'PV-Prognose','entity_id':'sensor.solcast_pv_forecast_prognose_heute','unit':'Wh'}},
 'consumers':[{'id':'heater','name':'Elektroheizung','type':'heater','enabled':True,'nominal_power_w':30000,'stages_w':[7500,15000,22500,30000],'priority':1},{'id':'compressor','name':'Kompressor','type':'motor','enabled':True,'nominal_power_w':11000,'stages_w':[],'priority':2}],
-'settings':{'grid_import_limit_w':30000,'battery_reserve_percent':25,'mode':'observe'}}
+'control_entities':{'mode':'select.sofar_speicher_inverter_energy_storage_mode','grid_setpoint':'number.sofar_speicher_inverter_passive_desired_grid_power','charge_power':'number.sofar_speicher_inverter_passive_maximum_battery_power','discharge_power':'number.sofar_speicher_inverter_passive_minimum_battery_power','apply_button':'button.sofar_speicher_inverter_passive_update_battery_charge_discharge'},'settings':{'grid_import_limit_w':5000,'battery_reserve_percent':25,'inverter_count':2,'control_enabled':False,'mode':'observe','grid_setpoint_sign':'unverified'}}
 def config():
  if not CFG.exists(): CFG.write_text(json.dumps(DEFAULT,ensure_ascii=False,indent=2))
  try:
   c=json.loads(CFG.read_text()); c.setdefault('plant_name',DEFAULT['plant_name']); c.setdefault('sensors',{})
   for k,v in DEFAULT['sensors'].items(): c['sensors'].setdefault(k,v)
-  c.setdefault('consumers',DEFAULT['consumers']); c.setdefault('settings',DEFAULT['settings']); return c
+  c.setdefault('consumers',DEFAULT['consumers']); c.setdefault('settings',{}); c.setdefault('control_entities',DEFAULT['control_entities'])
+  for k,v in DEFAULT['settings'].items(): c['settings'].setdefault(k,v)
+  for k,v in DEFAULT['control_entities'].items(): c['control_entities'].setdefault(k,v)
+  return c
  except Exception: return json.loads(json.dumps(DEFAULT))
 def save(c): CFG.write_text(json.dumps(c,ensure_ascii=False,indent=2))
 def ha(path):
@@ -50,7 +53,7 @@ def sampler():
    if HIST.stat().st_size>15000000:
     lines=HIST.read_text().splitlines()[-10000:]; HIST.write_text('\n'.join(lines)+'\n')
   except Exception:pass
-  time.sleep(max(60,int(os.getenv('SAMPLE_INTERVAL_SECONDS','300'))))
+  time.sleep(max(5,int(os.getenv('SAMPLE_INTERVAL_SECONDS','15'))))
 @app.route('/')
 def index():
  c=config(); s=snapshot(); _,err=states(); return render_template('index.html',cfg=c,snap=s,ha_error=err)
@@ -64,7 +67,15 @@ def config_page():
   for k,v in c['sensors'].items():
    val=request.form.get('sensor_'+k,'').strip()
    if val:v['entity_id']=val
-  try:c['settings']['grid_import_limit_w']=max(0,int(request.form.get('grid_import_limit_w','30000')));c['settings']['battery_reserve_percent']=max(0,min(100,int(request.form.get('battery_reserve_percent','25'))))
+  for k in c['control_entities']:
+   val=request.form.get('control_'+k,'').strip()
+   if val:c['control_entities'][k]=val
+  try:
+   c['settings']['grid_import_limit_w']=max(0,int(request.form.get('grid_import_limit_w','5000')))
+   c['settings']['battery_reserve_percent']=max(0,min(100,int(request.form.get('battery_reserve_percent','25'))))
+   c['settings']['inverter_count']=max(1,min(10,int(request.form.get('inverter_count','2'))))
+   c['settings']['control_enabled']=False
+   c['settings']['mode']='observe'
   except ValueError:flash('Grenzwerte müssen Zahlen sein.','error');return render_template('config.html',cfg=c,states=entities,ha_error=err)
   save(c);flash('Konfiguration gespeichert. Es wurden keine Geräte geschaltet.','success');entities,err=states();return render_template('config.html',cfg=c,states=entities,ha_error=err)
  return render_template('config.html',cfg=c,states=entities,ha_error=err)
@@ -95,7 +106,42 @@ def learning():
   vals=[r.get('values',{}).get(k) for r in rows];vals=[float(v) for v in vals if isinstance(v,(int,float))]
   stats[k]={'count':len(vals),'average':round(statistics.mean(vals),1) if vals else None,'min':round(min(vals),1) if vals else None,'max':round(max(vals),1) if vals else None}
  return render_template('learning.html',stats=stats,count=len(rows),history_file=str(HIST))
+
+@app.route('/api/plan')
+def api_plan():
+    """Advisory plan only: never sends commands to inverter or consumers."""
+    c=config()
+    snap=snapshot()
+    vals={k:((v or {}).get('value')) for k,v in snap.get('values',{}).items()}
+    def num(k):
+        v=vals.get(k)
+        return float(v) if isinstance(v,(int,float)) else None
+    pv=num('pv_power'); load=num('load_power'); grid=num('grid_power'); soc=num('battery_soc')
+    target=float(c.get('settings',{}).get('grid_import_limit_w',5000))
+    reserve=float(c.get('settings',{}).get('battery_reserve_percent',25))
+    inverter_count=int(c.get('settings',{}).get('inverter_count',2))
+    surplus=(pv-load) if pv is not None and load is not None else None
+    quality=[]
+    for k in ('pv_power','load_power','grid_power','battery_soc'):
+        item=snap.get('values',{}).get(k)
+        if not item or item.get('value') is None: quality.append(k)
+    advice=[]
+    if surplus is not None:
+        if surplus > 500:
+            advice.append({'type':'surplus','message':f'Geschätzter PV-Überschuss: {surplus:.0f} W. Verbraucher können nach Priorität geprüft werden.'})
+        elif surplus < -500:
+            advice.append({'type':'deficit','message':f'PV liegt etwa {abs(surplus):.0f} W unter dem Hausverbrauch.'})
+        else:
+            advice.append({'type':'balanced','message':'PV und Hausverbrauch liegen ungefähr auf gleichem Niveau.'})
+    if grid is not None and grid > target:
+        advice.append({'type':'grid_target','message':f'Netzbezug liegt {grid-target:.0f} W über dem weichen Ziel von {target:.0f} W.'})
+    if soc is not None and soc < reserve:
+        advice.append({'type':'reserve','message':f'Batterie-SoC liegt unter der eingestellten Reserve von {reserve:.0f} %.'})
+    return jsonify({'timestamp':snap.get('timestamp'),'mode':'advisory_only','commands_sent':False,
+        'target_grid_import_w':target,'inverter_count':inverter_count,'values':vals,
+        'estimated_pv_minus_load_w':surplus,'missing_or_invalid_sensors':quality,'advice':advice})
+
 @app.route('/health')
-def health():return jsonify({'status':'ok','mode':'read_only','timestamp':datetime.now(timezone.utc).isoformat()})
+def health():return jsonify({'status':'ok','mode':'observe','active_control_enabled':False,'timestamp':datetime.now(timezone.utc).isoformat()})
 if __name__=='__main__':
  threading.Thread(target=sampler,daemon=True).start();app.run(host='0.0.0.0',port=int(os.getenv('PORT','8099')))

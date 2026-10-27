@@ -1,7 +1,7 @@
 name: "Energiezentrale"
-version: "0.1.4"
+version: "0.2.0"
 slug: "energiezentrale"
-description: "Dunkles lokales Energiemanagement-Dashboard im reinen Beobachtungsmodus"
+description: "Dunkles Energiemanagement-Dashboard mit sicherer Steuerungsvorbereitung"
 arch: [aarch64, amd64]
 startup: application
 boot: auto
@@ -15,6 +15,6 @@ hassio_api: true
 map:
   - config:rw
 options:
-  sample_interval_seconds: 300
+  sample_interval_seconds: 15
 schema:
   sample_interval_seconds: int

@@ -17,3 +17,9 @@ Die Lernseite sammelt Daten und berechnet einfache Statistiken; sie ist noch kei
 - Read-only: keine Schaltbefehle an Geräte.
 - Konfiguration, Verbraucher und lokale Messwerthistorie bleiben verfügbar.
 - Hinweis: Lernen ist derzeit eine lokale Datensammlung mit Kennzahlen, noch kein autonomer Optimierer.
+
+
+## Update 0.2.0 – Steuerungsvorbereitung
+Diese Version setzt das persistente weiche Netzbezugsziel standardmäßig auf 5000 W, speichert die Anzahl parallel geregelter Wechselrichter (Standard 2) und bietet editierbare Felder für die SolaX-Modbus-Steuerungs-Entitäten. Die bestehende Steuerung ist weiterhin absichtlich gesperrt: Es werden keine Schreibbefehle an den Wechselrichter gesendet, bis Vorzeichen und Registersemantik vor Ort sicher geprüft sind. Die Dashboard-Messwerte und die einfache lokale Historie bleiben enthalten.
+
+Noch nicht enthalten: ein aktiver Optimierer, automatische Batterie-/Netzleistungsregelung, Verbraucher-Schaltlogik, Prognose-Lernmodell oder ein vollständig getesteter Produktionsbetrieb.
