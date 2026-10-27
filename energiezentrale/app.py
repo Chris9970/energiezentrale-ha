@@ -14,7 +14,7 @@ DEFAULT={'plant_name':'Meine Energiezentrale','sensors':{
 'inverter_output':{'label':'Wechselrichter-Ausgangsleistung','entity_id':'sensor.sofar_speicher_active_power_output_total','unit':'W'},
 'pv_forecast':{'label':'PV-Prognose','entity_id':'sensor.solcast_pv_forecast_prognose_heute','unit':'Wh'}},
 'consumers':[{'id':'heater','name':'Elektroheizung','type':'heater','enabled':True,'nominal_power_w':30000,'stages_w':[7500,15000,22500,30000],'priority':1},{'id':'compressor','name':'Kompressor','type':'motor','enabled':True,'nominal_power_w':11000,'stages_w':[],'priority':2}],
-'control_entities':{'mode':'select.sofar_speicher_inverter_energy_storage_mode','grid_setpoint':'number.sofar_speicher_inverter_passive_desired_grid_power','charge_power':'number.sofar_speicher_inverter_passive_maximum_battery_power','discharge_power':'number.sofar_speicher_inverter_passive_minimum_battery_power','apply_button':'button.sofar_speicher_inverter_passive_update_battery_charge_discharge'},'settings':{'grid_import_limit_w':5000,'battery_reserve_percent':25,'inverter_count':2,'control_enabled':False,'mode':'observe','grid_setpoint_sign':'unverified','grid_import_sign':'unverified','morning_start_hour':5,'morning_end_hour':9,'learning_days':14}}
+'control_entities':{'mode':'select.sofar_speicher_inverter_energy_storage_mode','grid_setpoint':'number.sofar_speicher_inverter_passive_desired_grid_power','charge_power':'number.sofar_speicher_inverter_passive_maximum_battery_power','discharge_power':'number.sofar_speicher_inverter_passive_minimum_battery_power','apply_button':'button.sofar_speicher_inverter_passive_update_battery_charge_discharge'},'settings':{'grid_import_limit_w':5000,'battery_reserve_percent':25,'inverter_count':2,'control_enabled':False,'mode':'observe','grid_setpoint_sign':'unverified','grid_import_sign':'unverified','morning_start_hour':5,'morning_end_hour':9,'learning_days':14,'battery_capacity_kwh':80,'battery_discharge_power_kw':30}}
 def config():
  if not CFG.exists(): CFG.write_text(json.dumps(DEFAULT,ensure_ascii=False,indent=2))
  try:
@@ -54,6 +54,88 @@ def sampler():
     lines=HIST.read_text().splitlines()[-10000:]; HIST.write_text('\n'.join(lines)+'\n')
   except Exception:pass
   time.sleep(max(5,int(os.getenv('SAMPLE_INTERVAL_SECONDS','15'))))
+
+
+def build_battery_plan(c, rows, snap=None):
+    """Advisory battery plan from measured morning peaks and configured PV forecast.
+    No inverter/consumer commands are sent by this function."""
+    st = c.get('settings', {})
+    sign = st.get('grid_import_sign', 'unverified')
+    target_w = max(0.0, float(st.get('grid_import_limit_w', 5000)))
+    reserve_pct = max(0.0, min(100.0, float(st.get('battery_reserve_percent', 25))))
+    capacity_kwh = max(0.0, float(st.get('battery_capacity_kwh', 80)))
+    max_discharge_kw = max(0.0, float(st.get('battery_discharge_power_kw', 30)))
+    morning_start = int(st.get('morning_start_hour', 5))
+    morning_end = int(st.get('morning_end_hour', 9))
+    now = datetime.now().astimezone()
+    cutoff = now.timestamp() - max(1, int(st.get('learning_days', 14))) * 86400
+    daily = {}
+    for row in rows:
+        try:
+            ts = datetime.fromisoformat(row.get('timestamp','').replace('Z','+00:00')).timestamp()
+            if ts < cutoff: continue
+            dt = datetime.fromtimestamp(ts).astimezone()
+            if not (morning_start <= dt.hour < morning_end): continue
+            raw = row.get('values', {}).get('grid_power')
+            if not isinstance(raw, (int,float)): continue
+            imp = (-float(raw) if sign == 'negative' else float(raw) if sign == 'positive' else None)
+            if imp is None: continue
+            daily.setdefault(dt.date().isoformat(), []).append(max(0.0, imp))
+        except Exception:
+            continue
+    # Estimate energy needed above the soft target, using sampled time intervals.
+    # Missing intervals are conservatively not extrapolated.
+    daily_excess_kwh = {}
+    daily_peak_w = {}
+    for day, vals in daily.items():
+        daily_peak_w[day] = max(vals) if vals else 0.0
+        # Approximate energy above target using the configured sample interval.
+        step_h = max(5, int(os.getenv('SAMPLE_INTERVAL_SECONDS','15'))) / 3600.0
+        daily_excess_kwh[day] = sum(max(0.0, v-target_w) for v in vals) * step_h / 1000.0
+    enough = len(daily) >= 3
+    peak_median = statistics.median(daily_peak_w.values()) if enough else None
+    excess_median = statistics.median(daily_excess_kwh.values()) if enough else None
+    vals = {k: ((v or {}).get('value')) for k,v in (snap or snapshot()).get('values',{}).items()}
+    def number(x):
+        return float(x) if isinstance(x,(int,float)) else None
+    soc = number(vals.get('battery_soc'))
+    pv_forecast = number(vals.get('pv_forecast'))
+    load = number(vals.get('load_power'))
+    # Solcast entity commonly reports Wh; convert to kWh if its unit indicates Wh.
+    pv_unit = ((snap or snapshot()).get('values',{}).get('pv_forecast') or {}).get('unit','').lower()
+    pv_kwh = (pv_forecast/1000.0 if pv_forecast is not None and ('wh' == pv_unit or 'wh' in pv_unit and 'kwh' not in pv_unit) else pv_forecast) if pv_forecast is not None else None
+    if soc is not None:
+        reserve_kwh = capacity_kwh * reserve_pct / 100.0
+        current_kwh = capacity_kwh * max(0.0,min(100.0,soc)) / 100.0
+        usable_above_reserve = max(0.0, current_kwh-reserve_kwh)
+    else:
+        reserve_kwh = current_kwh = usable_above_reserve = None
+    # Required energy includes the empirical energy above the soft grid target,
+    # but never invents a forecast if insufficient historical data exists.
+    required_kwh = max(reserve_kwh or 0.0, (reserve_kwh or 0.0) + (excess_median or 0.0)) if enough else None
+    target_soc = min(100.0, required_kwh/capacity_kwh*100.0) if required_kwh is not None and capacity_kwh else None
+    advice = []
+    if not enough:
+        advice.append(f'Für belastbare Batterieplanung werden mindestens drei vollständige Morgen mit gültigen Netzleistungsdaten benötigt; aktuell: {len(daily)}.')
+    else:
+        advice.append(f'Median der morgendlichen Netzbezugs-Spitzen: {peak_median:.0f} W.')
+        advice.append(f'Geschätzte tägliche Energie oberhalb des weichen {target_w:.0f}-W-Ziels: {excess_median:.2f} kWh.')
+        advice.append(f'Vorläufig empfohlene Reserve inklusive Grundreserve: {required_kwh:.1f} kWh (ca. {target_soc:.0f} % SoC).')
+    if soc is None: advice.append('Batterie-SoC fehlt; aktuelle verfügbare Energie kann nicht berechnet werden.')
+    elif usable_above_reserve is not None: advice.append(f'Aktuell geschätzte Energie oberhalb der Grundreserve: {usable_above_reserve:.1f} kWh.')
+    if pv_kwh is None: advice.append('Keine gültige PV-Prognose gefunden; Prognose-Entity und Einheit prüfen.')
+    else: advice.append(f'PV-Prognose aus Home Assistant: etwa {pv_kwh:.1f} kWh (Einheit anhand Sensorattributen interpretiert).')
+    if load is not None: advice.append(f'Aktueller Hausverbrauch: {load:.0f} W; dies ist kein Tagesverbrauchs-Forecast.')
+    advice.append('Nur Empfehlung: Diese Planung sendet keine Befehle an Wechselrichter oder Verbraucher.')
+    return {'mode':'advisory_only','commands_sent':False,'history_days_available':len(daily),
+        'target_grid_import_w':target_w,'grid_import_sign':sign,'battery_capacity_kwh':capacity_kwh,
+        'max_discharge_power_kw':max_discharge_kw,'battery_soc_percent':soc,
+        'current_energy_kwh':current_kwh,'base_reserve_kwh':reserve_kwh,
+        'usable_energy_above_base_reserve_kwh':usable_above_reserve,
+        'median_morning_peak_w':peak_median,'median_energy_above_grid_target_kwh':excess_median,
+        'recommended_morning_reserve_kwh':required_kwh,'recommended_morning_soc_percent':target_soc,
+        'pv_forecast_kwh':pv_kwh,'advice':advice}
+
 @app.route('/')
 def index():
  c=config(); s=snapshot(); _,err=states(); return render_template('index.html',cfg=c,snap=s,ha_error=err)
@@ -74,6 +156,8 @@ def config_page():
    c['settings']['grid_import_limit_w']=max(0,int(request.form.get('grid_import_limit_w','5000')))
    c['settings']['battery_reserve_percent']=max(0,min(100,int(request.form.get('battery_reserve_percent','25'))))
    c['settings']['inverter_count']=max(1,min(10,int(request.form.get('inverter_count','2'))))
+   c['settings']['battery_capacity_kwh']=max(1,min(500,int(request.form.get('battery_capacity_kwh','80'))))
+   c['settings']['battery_discharge_power_kw']=max(1,min(100,int(request.form.get('battery_discharge_power_kw','30'))))
    c['settings']['control_enabled']=False
    c['settings']['mode']='observe'
    c['settings']['morning_start_hour']=max(0,min(23,int(request.form.get('morning_start_hour','5'))))
@@ -136,8 +220,7 @@ def learning():
 @app.route('/api/plan')
 def api_plan():
     """Advisory plan only: never sends commands to inverter or consumers."""
-    c=config()
-    snap=snapshot()
+    c=config(); snap=snapshot()
     vals={k:((v or {}).get('value')) for k,v in snap.get('values',{}).items()}
     def num(k):
         v=vals.get(k)
@@ -145,7 +228,8 @@ def api_plan():
     pv=num('pv_power'); load=num('load_power'); grid=num('grid_power'); soc=num('battery_soc')
     target=float(c.get('settings',{}).get('grid_import_limit_w',5000))
     reserve=float(c.get('settings',{}).get('battery_reserve_percent',25))
-    inverter_count=int(c.get('settings',{}).get('inverter_count',2))
+    sign=c.get('settings',{}).get('grid_import_sign','unverified')
+    grid_import_w=(-grid if sign=='negative' else grid if sign=='positive' else None) if grid is not None else None
     surplus=(pv-load) if pv is not None and load is not None else None
     quality=[]
     for k in ('pv_power','load_power','grid_power','battery_soc'):
@@ -158,17 +242,23 @@ def api_plan():
             available=[x for x in consumers if int(x.get('nominal_power_w',0)) <= surplus]
             names=', '.join(x.get('name','Verbraucher') for x in available[:3])
             advice.append({'type':'surplus','message':f'Geschätzter PV-Überschuss: {surplus:.0f} W.' + (f' Nach Nennleistung passend: {names}.' if names else ' Kein aktivierter Verbraucher passt mit seiner Nennleistung vollständig in den geschätzten Überschuss.')})
-        elif surplus < -500:
-            advice.append({'type':'deficit','message':f'PV liegt etwa {abs(surplus):.0f} W unter dem Hausverbrauch.'})
-        else:
-            advice.append({'type':'balanced','message':'PV und Hausverbrauch liegen ungefähr auf gleichem Niveau.'})
-    if grid is not None and grid > target:
-        advice.append({'type':'grid_target','message':f'Netzbezug liegt {grid-target:.0f} W über dem weichen Ziel von {target:.0f} W.'})
-    if soc is not None and soc < reserve:
-        advice.append({'type':'reserve','message':f'Batterie-SoC liegt unter der eingestellten Reserve von {reserve:.0f} %.'})
+        elif surplus < -500: advice.append({'type':'deficit','message':f'PV liegt etwa {abs(surplus):.0f} W unter dem Hausverbrauch.'})
+        else: advice.append({'type':'balanced','message':'PV und Hausverbrauch liegen ungefähr auf gleichem Niveau.'})
+    if grid_import_w is not None and grid_import_w > target:
+        advice.append({'type':'grid_target','message':f'Netzbezug liegt {grid_import_w-target:.0f} W über dem weichen Ziel von {target:.0f} W.'})
+    if soc is not None and soc < reserve: advice.append({'type':'reserve','message':f'Batterie-SoC liegt unter der eingestellten Reserve von {reserve:.0f} %.'})
     return jsonify({'timestamp':snap.get('timestamp'),'mode':'advisory_only','commands_sent':False,
-        'target_grid_import_w':target,'inverter_count':inverter_count,'values':vals,
+        'target_grid_import_w':target,'grid_import_sign':sign,'grid_import_w':grid_import_w,
+        'inverter_count':int(c.get('settings',{}).get('inverter_count',2)),'values':vals,
         'estimated_pv_minus_load_w':surplus,'missing_or_invalid_sensors':quality,'advice':advice})
+
+@app.route('/api/battery-plan')
+def api_battery_plan():
+    rows=[]
+    if HIST.exists():
+        try: rows=[json.loads(x) for x in HIST.read_text().splitlines()[-100000:] if x.strip()]
+        except Exception: rows=[]
+    return jsonify(build_battery_plan(config(), rows, snapshot()))
 
 @app.route('/health')
 def health():return jsonify({'status':'ok','mode':'observe','active_control_enabled':False,'timestamp':datetime.now(timezone.utc).isoformat()})

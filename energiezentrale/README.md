@@ -1,8 +1,8 @@
-# Energiezentrale 0.3.0
+# Energiezentrale 0.4.0
 
 Home Assistant Add-on mit lokalem Dashboard, konfigurierbaren Sensoren und Verbraucher-Stammdaten.
 
-## In 0.3.0 umgesetzt
+## In 0.4.0 umgesetzt
 - Persistente Konfiguration in `/data/config.json`.
 - Home-Assistant-Entity-IDs für Messwerte und SolaX-Modbus-Steuerungsentitäten frei konfigurierbar.
 - Konfigurierbares Messintervall über Add-on-Option `sample_interval_seconds` (Standard 15 s).
