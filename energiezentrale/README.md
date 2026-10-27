@@ -1,21 +1,26 @@
-# Energiezentrale 0.4.0
+# Energiezentrale 0.5.0
 
-Home Assistant Add-on mit lokalem Dashboard, konfigurierbaren Sensoren und Verbraucher-Stammdaten.
+## In 0.5.0 umgesetzt
+- Neue beratende PV-Überschussplanung auf der Seite „Verbraucher“.
+- Schätzt Einspeisung anhand des konfigurierten Netzleistungs-Vorzeichens.
+- Berücksichtigt einen Sicherheitsabstand von 1000 W.
+- Ordnet aktivierte Verbraucher nach Priorität und schlägt passende Heizstufen/Nennleistungen vor.
+- Keine Schaltbefehle an Verbraucher oder Wechselrichter; aktive Regelung bleibt deaktiviert.
 
-## In 0.4.0 umgesetzt
-- Persistente Konfiguration in `/data/config.json`.
-- Home-Assistant-Entity-IDs für Messwerte und SolaX-Modbus-Steuerungsentitäten frei konfigurierbar.
-- Konfigurierbares Messintervall über Add-on-Option `sample_interval_seconds` (Standard 15 s).
-- Messwerthistorie in `/data/history.jsonl` mit Größenbegrenzung.
-- Statistik über vorhandene historische Messwerte.
-- Historische morgendliche Netzbezugs-Spitzen: täglicher Höchstwert und Median, nur wenn das Vorzeichen des Netzleistungssensors ausdrücklich konfiguriert und mindestens drei Tage Daten vorhanden sind.
-- Beratender Plan-Endpunkt `/api/plan`, der PV minus Last, weiches Netzbezugsziel und passende Verbraucher nach Nennleistung anzeigt.
-- Keine Steuerbefehle werden gesendet. Aktive Steuerung ist absichtlich gesperrt.
+## Weiterhin enthalten
+- Home-Assistant-Sensorübersicht und lokale Messwerthistorie.
+- Statistiken und beratende Batterie-Morgenreserve aus historischen Daten.
+- Konfigurierbares weiches Netzbezugsziel, Batteriekapazität und Reserve.
 
-## Noch nicht umgesetzt
-- Keine autonome Optimierung, kein ML-Modell und keine automatischen Batterie-Sollwerte.
-- Keine Schaltung von Verbrauchern.
-- Keine aktive Steuerung der Wechselrichter.
-- Keine Garantie für vollständige Kompatibilität mit jedem Home-Assistant-/Ingress-Setup ohne Test auf dem Zielsystem.
+## Hinweise
+- Das Add-on muss über Home Assistant Supervisor gestartet werden, damit die Home-Assistant-API verfügbar ist.
+- Die Netzleistungs-Vorzeichenkonfiguration muss anhand realer Messwerte stimmen. Für die beschriebene Anlage gilt: Netzbezug negativ, Einspeisung positiv.
+- Die Verbraucherplanung ist nur eine rechnerische Vorauswahl. Vor einer späteren Automatisierung sind Anlaufströme, Mindestlaufzeiten, Druck-/Temperaturgrenzen, gegenseitige Verriegelungen und sichere Ausgänge gesondert zu implementieren und zu testen.
+- Python-Syntax wurde geprüft. Ein vollständiger Laufzeittest war in der Erstellungsumgebung nicht möglich, da Flask dort nicht installiert ist.
 
-Vor einer Steuerungsfreigabe müssen Registersemantik, Vorzeichen, Einheiten, Skalierung beider Wechselrichter und Fehlerverhalten an der realen Anlage verifiziert werden.
+
+## Version 0.5.0
+- Ergänzte konfigurierbare Zeitfenster für die Flüssigfütterung als reine Lastprognose (Standard: 06:45, 12:00, 18:15; Laufzeit 8 Minuten; Leistung 0 = unbekannt).
+- Einstellbarer PV-Überschuss-Sicherheitsabstand.
+- Neue historische Spitzenanalyse unter `/api/peak-analysis`; Dauer oberhalb des Ziels wird nur bei lückenarmen benachbarten Messpunkten geschätzt.
+- Keine aktiven Wechselrichter- oder Verbraucherbefehle; Steuerung bleibt deaktiviert.

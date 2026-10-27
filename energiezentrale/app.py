@@ -14,7 +14,7 @@ DEFAULT={'plant_name':'Meine Energiezentrale','sensors':{
 'inverter_output':{'label':'Wechselrichter-Ausgangsleistung','entity_id':'sensor.sofar_speicher_active_power_output_total','unit':'W'},
 'pv_forecast':{'label':'PV-Prognose','entity_id':'sensor.solcast_pv_forecast_prognose_heute','unit':'Wh'}},
 'consumers':[{'id':'heater','name':'Elektroheizung','type':'heater','enabled':True,'nominal_power_w':30000,'stages_w':[7500,15000,22500,30000],'priority':1},{'id':'compressor','name':'Kompressor','type':'motor','enabled':True,'nominal_power_w':11000,'stages_w':[],'priority':2}],
-'control_entities':{'mode':'select.sofar_speicher_inverter_energy_storage_mode','grid_setpoint':'number.sofar_speicher_inverter_passive_desired_grid_power','charge_power':'number.sofar_speicher_inverter_passive_maximum_battery_power','discharge_power':'number.sofar_speicher_inverter_passive_minimum_battery_power','apply_button':'button.sofar_speicher_inverter_passive_update_battery_charge_discharge'},'settings':{'grid_import_limit_w':5000,'battery_reserve_percent':25,'inverter_count':2,'control_enabled':False,'mode':'observe','grid_setpoint_sign':'unverified','grid_import_sign':'unverified','morning_start_hour':5,'morning_end_hour':9,'learning_days':14,'battery_capacity_kwh':80,'battery_discharge_power_kw':30}}
+'control_entities':{'mode':'select.sofar_speicher_inverter_energy_storage_mode','grid_setpoint':'number.sofar_speicher_inverter_passive_desired_grid_power','charge_power':'number.sofar_speicher_inverter_passive_maximum_battery_power','discharge_power':'number.sofar_speicher_inverter_passive_minimum_battery_power','apply_button':'button.sofar_speicher_inverter_passive_update_battery_charge_discharge'},'settings':{'grid_import_limit_w':5000,'battery_reserve_percent':25,'inverter_count':2,'control_enabled':False,'mode':'observe','grid_setpoint_sign':'unverified','grid_import_sign':'unverified','morning_start_hour':5,'morning_end_hour':9,'learning_days':14,'battery_capacity_kwh':80,'battery_discharge_power_kw':30,'silage_slots':['06:30','12:00','18:00'],'silage_flex_minutes':45,'silage_duration_minutes':15,'feeding_slots':['06:45','12:00','18:15'],'feeding_flex_minutes':10,'feeding_duration_minutes':8,'feeding_power_w':0,'consumer_surplus_margin_w':1000}}
 def config():
  if not CFG.exists(): CFG.write_text(json.dumps(DEFAULT,ensure_ascii=False,indent=2))
  try:
@@ -180,7 +180,29 @@ def consumers():
    try:p=max(0,int(request.form.get('new_power','0')))
    except ValueError:p=0
    c['consumers'].append({'id':'consumer_'+str(int(time.time())),'name':name,'type':'custom','enabled':True,'nominal_power_w':p,'stages_w':[],'priority':3})
-  save(c);flash('Verbraucher gespeichert. Steuerung bleibt deaktiviert.','success');return render_template('consumers.html',cfg=c)
+  slots=[]
+  for field in ('silage_slot_1','silage_slot_2','silage_slot_3'):
+   value=request.form.get(field,'').strip()
+   if value and len(value)==5 and value[2]==':' and value[:2].isdigit() and value[3:].isdigit() and 0<=int(value[:2])<=23 and 0<=int(value[3:])<=59: slots.append(value)
+  c['settings']['silage_slots']=slots
+  try:c['settings']['silage_flex_minutes']=min(180,max(0,int(request.form.get('silage_flex_minutes','45'))))
+  except ValueError:c['settings']['silage_flex_minutes']=45
+  try:c['settings']['silage_duration_minutes']=min(120,max(1,int(request.form.get('silage_duration_minutes','15'))))
+  except ValueError:c['settings']['silage_duration_minutes']=15
+  feeding=[]
+  for field in ('feeding_slot_1','feeding_slot_2','feeding_slot_3'):
+   value=request.form.get(field,'').strip()
+   if value and len(value)==5 and value[2]==':' and value[:2].isdigit() and value[3:].isdigit() and 0<=int(value[:2])<=23 and 0<=int(value[3:])<=59: feeding.append(value)
+  c['settings']['feeding_slots']=feeding
+  try:c['settings']['feeding_flex_minutes']=min(180,max(0,int(request.form.get('feeding_flex_minutes','10'))))
+  except ValueError:c['settings']['feeding_flex_minutes']=10
+  try:c['settings']['feeding_duration_minutes']=min(60,max(1,int(request.form.get('feeding_duration_minutes','8'))))
+  except ValueError:c['settings']['feeding_duration_minutes']=8
+  try:c['settings']['feeding_power_w']=min(100000,max(0,int(request.form.get('feeding_power_w','0'))))
+  except ValueError:c['settings']['feeding_power_w']=0
+  try:c['settings']['consumer_surplus_margin_w']=min(20000,max(0,int(request.form.get('consumer_surplus_margin_w','1000'))))
+  except ValueError:c['settings']['consumer_surplus_margin_w']=1000
+  save(c);flash('Verbraucher und flexible Zeitfenster gespeichert. Steuerung bleibt deaktiviert.','success');return render_template('consumers.html',cfg=c)
  return render_template('consumers.html',cfg=c)
 @app.route('/learning')
 def learning():
@@ -214,8 +236,9 @@ def learning():
     daily={}
     for x in morning: daily[x['day']]=max(daily.get(x['day'],0),x['grid_import_w'])
     learned_peak=round(statistics.median(daily.values()),0) if len(daily)>=3 else None
+    battery_plan=build_battery_plan(c, rows, snapshot())
     return render_template('learning.html',cfg=c,stats=stats,count=len(recent),history_file=str(HIST),days=days,
-        morning_count=len(daily),morning_peak=learned_peak,grid_import_sign=sign,daily_peaks=daily)
+        morning_count=len(daily),morning_peak=learned_peak,grid_import_sign=sign,daily_peaks=daily,battery_plan=battery_plan)
 
 @app.route('/api/plan')
 def api_plan():
@@ -252,6 +275,53 @@ def api_plan():
         'inverter_count':int(c.get('settings',{}).get('inverter_count',2)),'values':vals,
         'estimated_pv_minus_load_w':surplus,'missing_or_invalid_sensors':quality,'advice':advice})
 
+@app.route('/api/consumer-plan')
+def api_consumer_plan():
+    """Suggest suitable consumer stages from measured grid export; advisory only."""
+    c = config()
+    snap = snapshot()
+    item = (snap.get('values', {}).get('grid_power') or {})
+    raw = item.get('value')
+    sign = c.get('settings', {}).get('grid_import_sign', 'unverified')
+    export_w = None
+    if isinstance(raw, (int, float)):
+        if sign == 'negative':
+            export_w = max(0.0, float(raw))
+        elif sign == 'positive':
+            export_w = max(0.0, -float(raw))
+    margin_w = max(0, int(c.get('settings', {}).get('consumer_surplus_margin_w', 1000)))
+    available_w = max(0.0, export_w - margin_w) if export_w is not None else None
+    recommendations = []
+    consumers = sorted((x for x in c.get('consumers', []) if x.get('enabled')),
+                       key=lambda x: int(x.get('priority', 99)))
+    remaining = available_w
+    if remaining is not None:
+        for consumer in consumers:
+            try:
+                stages = sorted({int(v) for v in consumer.get('stages_w', []) if int(v) > 0})
+            except (TypeError, ValueError):
+                stages = []
+            nominal = max(0, int(consumer.get('nominal_power_w', 0)))
+            options = [v for v in stages if v <= remaining]
+            chosen = max(options) if options else (nominal if nominal and nominal <= remaining else 0)
+            recommendations.append({
+                'id': consumer.get('id'), 'name': consumer.get('name', 'Verbraucher'),
+                'priority': int(consumer.get('priority', 99)), 'nominal_power_w': nominal,
+                'suggested_power_w': chosen,
+                'status': 'fits' if chosen > 0 else 'wait',
+                'note': (f'{chosen} W passen rechnerisch in den verfügbaren Überschuss.' if chosen > 0
+                         else 'Der verfügbare Überschuss reicht mit Sicherheitsabstand nicht für eine Stufe.')
+            })
+            remaining = max(0.0, remaining - chosen)
+    return jsonify({
+        'timestamp': snap.get('timestamp'), 'mode': 'advisory_only', 'commands_sent': False,
+        'grid_import_sign': sign, 'grid_power_raw_w': raw, 'estimated_export_w': export_w,
+        'safety_margin_w': margin_w, 'available_surplus_after_margin_w': available_w,
+        'recommendations': recommendations,
+        'warning': ('Netzleistungs-Vorzeichen erst in der Konfiguration bestätigen.' if export_w is None else
+                    'Nur Vorschlag: keine Verbraucher werden geschaltet. Vor dem Betrieb Anlaufstrom, Mindestlaufzeiten und Verriegelungen berücksichtigen.')
+    })
+
 @app.route('/api/battery-plan')
 def api_battery_plan():
     rows=[]
@@ -259,6 +329,38 @@ def api_battery_plan():
         try: rows=[json.loads(x) for x in HIST.read_text().splitlines()[-100000:] if x.strip()]
         except Exception: rows=[]
     return jsonify(build_battery_plan(config(), rows, snapshot()))
+
+
+@app.route('/api/peak-analysis')
+def api_peak_analysis():
+    """Historical soft-grid-target analysis; respects actual timestamp gaps."""
+    c=config(); st=c.get('settings',{}); sign=st.get('grid_import_sign','unverified')
+    target=max(0,float(st.get('grid_import_limit_w',5000)))
+    days=max(1,min(90,int(st.get('learning_days',14))))
+    rows=[]
+    if HIST.exists():
+        try: rows=[json.loads(x) for x in HIST.read_text().splitlines()[-100000:] if x.strip()]
+        except Exception: rows=[]
+    cutoff=datetime.now(timezone.utc).timestamp()-days*86400
+    samples=[]
+    for row in rows:
+        try:
+            ts=datetime.fromisoformat(row.get('timestamp','').replace('Z','+00:00')).timestamp()
+            raw=row.get('values',{}).get('grid_power')
+            if ts<cutoff or not isinstance(raw,(int,float)): continue
+            imp=(-float(raw) if sign=='negative' else float(raw) if sign=='positive' else None)
+            if imp is not None: samples.append((ts,max(0,imp)))
+        except Exception: continue
+    samples.sort(); daily={}; over_count=0; max_gap=max(30,int(os.getenv('SAMPLE_INTERVAL_SECONDS','15'))*2)
+    for i,(ts,w) in enumerate(samples):
+        day=datetime.fromtimestamp(ts).astimezone().date().isoformat()
+        d=daily.setdefault(day,{'peak_w':0,'samples_over_target':0,'estimated_minutes_over_target':0.0})
+        d['peak_w']=max(d['peak_w'],round(w));
+        if w>target:
+            over_count+=1; d['samples_over_target']+=1
+            if i+1<len(samples) and samples[i+1][0]-ts<=max_gap:
+                d['estimated_minutes_over_target']+=(samples[i+1][0]-ts)/60.0
+    return jsonify({'mode':'advisory_only','commands_sent':False,'target_w':target,'sign':sign,'days_requested':days,'valid_samples':len(samples),'samples_over_target':over_count,'daily':daily,'warning':'Dauer oberhalb des Ziels ist nur eine Schätzung aus benachbarten Messpunkten; Datenlücken werden nicht hochgerechnet.' if sign!='unverified' else 'Netzleistungs-Vorzeichen zuerst in der Konfiguration bestätigen.'})
 
 @app.route('/health')
 def health():return jsonify({'status':'ok','mode':'observe','active_control_enabled':False,'timestamp':datetime.now(timezone.utc).isoformat()})
