@@ -1,5 +1,5 @@
 name: "Energiezentrale"
-version: "0.1.0"
+version: "0.1.1"
 slug: "energiezentrale"
 description: "Lokale Energieübersicht mit Home-Assistant-Sensoren und konfigurierbaren Verbrauchern"
 arch: [aarch64, amd64]
