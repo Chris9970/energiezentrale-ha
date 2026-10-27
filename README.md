@@ -31,5 +31,5 @@ Wenn der Build oder Start fehlschlägt, bitte die App-Protokolle sichern. Die St
 - `energiezentrale/templates/` und `energiezentrale/static/`: Oberfläche
 
 
-## Update 0.1.3
+## Update 0.1.4
 Diese Version ergänzt das dunkle Dashboard und die sichtbare aktive Navigation. Die App bleibt strikt im Beobachtungsmodus. Die Lernseite sammelt Messpunkte und zeigt Kennzahlen; fortgeschrittene Prognose-/Optimierungsfunktionen sind noch nicht als fertig zu betrachten.
