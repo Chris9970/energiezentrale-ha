@@ -157,9 +157,30 @@ def build_battery_plan(c, rows, snap=None):
         usable_above_reserve = max(0.0, current_kwh-reserve_kwh)
     else:
         reserve_kwh = current_kwh = usable_above_reserve = None
-    # Required energy includes the empirical energy above the soft grid target,
-    # but never invents a forecast if insufficient historical data exists.
-    required_kwh = max(reserve_kwh or 0.0, (reserve_kwh or 0.0) + (excess_median or 0.0)) if enough else None
+    # Bring recurring aggregate house-load patterns into the morning-reserve
+    # estimate. This is deliberately conservative: it is an estimate of the
+    # learned recurring load in the configured morning window, not a claim that
+    # the battery must supply all of it (PV may cover part of it).
+    learned = learn_load_patterns(rows, st.get('learning_days', 14))
+    morning_patterns = []
+    for pattern in learned.get('patterns', []):
+        try:
+            hh, mm = (int(part) for part in pattern['time'].split(':'))
+            if morning_start <= hh < morning_end:
+                morning_patterns.append(pattern)
+        except (ValueError, KeyError, TypeError):
+            continue
+    learned_morning_load_kwh = sum(float(p.get('median_w', 0)) * 0.25 / 1000.0 for p in morning_patterns)
+    learned_days_min = min((int(p.get('days_seen', 0)) for p in morning_patterns), default=0)
+    learned_morning_confidence = ('hoch' if morning_patterns and all(p.get('confidence') == 'hoch' for p in morning_patterns)
+                                  else 'mittel' if morning_patterns and learned_days_min >= 5 else 'vorläufig' if morning_patterns else 'keine')
+    # The learned profile is a cross-check, not blindly added to measured grid
+    # excess (which would double-count energy). Use at most half of the learned
+    # morning load as a provisional reserve signal, and only with >=3 valid
+    # morning grid-history days. Existing measured excess remains authoritative.
+    learned_reserve_signal_kwh = learned_morning_load_kwh * 0.5 if enough and morning_patterns else 0.0
+    reserve_addition_kwh = max(excess_median or 0.0, learned_reserve_signal_kwh) if enough else None
+    required_kwh = max(reserve_kwh or 0.0, (reserve_kwh or 0.0) + reserve_addition_kwh) if enough else None
     target_soc = min(100.0, required_kwh/capacity_kwh*100.0) if required_kwh is not None and capacity_kwh else None
     advice = []
     if not enough:
@@ -167,6 +188,11 @@ def build_battery_plan(c, rows, snap=None):
     else:
         advice.append(f'Median der morgendlichen Netzbezugs-Spitzen: {peak_median:.0f} W.')
         advice.append(f'Geschätzte tägliche Energie oberhalb des weichen {target_w:.0f}-W-Ziels: {excess_median:.2f} kWh.')
+        if morning_patterns:
+            advice.append(f'Gelernte wiederkehrende Morgenlast: ca. {learned_morning_load_kwh:.2f} kWh in {len(morning_patterns)} erkannten 15-Minuten-Zeitfenstern; Vertrauensstufe: {learned_morning_confidence}.')
+            advice.append('Die gelernte Last beeinflusst die Reserve nur vorsichtig (höchstens 50 % als Zusatzsignal), da PV-Erzeugung und Netz-/Batterieanteile nicht für jede Last sicher getrennt werden können.')
+        else:
+            advice.append('Noch kein ausreichend wiederkehrendes Hausverbrauchsmuster im eingestellten Morgenfenster erkannt; Reserve basiert vorerst auf den gemessenen Netzspitzen.')
         advice.append(f'Vorläufig empfohlene Reserve inklusive Grundreserve: {required_kwh:.1f} kWh (ca. {target_soc:.0f} % SoC).')
     if soc is None: advice.append('Batterie-SoC fehlt; aktuelle verfügbare Energie kann nicht berechnet werden.')
     elif usable_above_reserve is not None: advice.append(f'Aktuell geschätzte Energie oberhalb der Grundreserve: {usable_above_reserve:.1f} kWh.')
@@ -183,6 +209,10 @@ def build_battery_plan(c, rows, snap=None):
         'current_energy_kwh':current_kwh,'base_reserve_kwh':reserve_kwh,
         'usable_energy_above_base_reserve_kwh':usable_above_reserve,
         'median_morning_peak_w':peak_median,'median_energy_above_grid_target_kwh':excess_median,
+        'learned_morning_pattern_slots':len(morning_patterns),
+        'learned_morning_load_estimate_kwh':round(learned_morning_load_kwh, 3),
+        'learned_morning_confidence':learned_morning_confidence,
+        'learned_reserve_signal_kwh':round(learned_reserve_signal_kwh, 3),
         'recommended_morning_reserve_kwh':required_kwh,'recommended_morning_soc_percent':target_soc,
         'pv_forecast_kwh':pv_kwh,'advice':advice}
 
@@ -273,8 +303,64 @@ def consumers():
   except ValueError:c['settings']['feeding_power_w']=0
   try:c['settings']['consumer_surplus_margin_w']=min(20000,max(0,int(request.form.get('consumer_surplus_margin_w','1000'))))
   except ValueError:c['settings']['consumer_surplus_margin_w']=1000
-  save(c);flash('Verbraucher und flexible Zeitfenster gespeichert. Steuerung bleibt deaktiviert.','success');return render_template('consumers.html',cfg=c)
+  save(c);flash('Verbraucher gespeichert. Nur die Silagefräse hat feste, frei einstellbare Sollzeiten; andere Verbraucher bleiben flexibel. Steuerung bleibt deaktiviert.','success');return render_template('consumers.html',cfg=c)
  return render_template('consumers.html',cfg=c)
+def learn_load_patterns(rows, days=14, min_power_w=1000, min_days=3):
+    """Learn recurring aggregate house-load patterns in local 15-minute slots.
+
+    Uses per-day medians so a single brief spike cannot dominate the learned
+    profile. It does not identify individual appliances and never controls loads.
+    """
+    cutoff = datetime.now(timezone.utc).timestamp() - max(1, int(days)) * 86400
+    per_slot_day = {}
+    valid_days = set()
+    for row in rows:
+        try:
+            ts = datetime.fromisoformat(row.get('timestamp', '').replace('Z', '+00:00')).timestamp()
+            if ts < cutoff:
+                continue
+            raw = row.get('values', {}).get('load_power')
+            if not isinstance(raw, (int, float)) or raw < 0 or raw > 250000:
+                continue
+            dt = datetime.fromtimestamp(ts).astimezone()
+            slot = (dt.hour * 60 + (dt.minute // 15) * 15)
+            day = dt.date().isoformat()
+            per_slot_day.setdefault(slot, {}).setdefault(day, []).append(float(raw))
+            valid_days.add(day)
+        except (ValueError, TypeError, OverflowError):
+            continue
+    profile = []
+    for slot, day_values in per_slot_day.items():
+        if len(day_values) < min_days:
+            continue
+        daily_medians = [statistics.median(v) for v in day_values.values() if v]
+        typical = statistics.median(daily_medians) if daily_medians else 0
+        if typical < min_power_w:
+            continue
+        profile.append({
+            'time': f'{slot // 60:02d}:{slot % 60:02d}',
+            'median_w': round(typical),
+            'days_seen': len(day_values),
+            'confidence': 'hoch' if len(day_values) >= 7 else 'mittel' if len(day_values) >= 5 else 'vorläufig'
+        })
+    profile.sort(key=lambda x: x['time'])
+    return {'days_with_load_data': len(valid_days), 'patterns': profile,
+            'min_days_required': min_days, 'slot_minutes': 15,
+            'note': 'Aggregate house load; appliance identity is not inferred.'}
+
+
+@app.route('/api/learned-load-patterns')
+def api_learned_load_patterns():
+    rows = []
+    if HIST.exists():
+        try:
+            rows = [json.loads(x) for x in HIST.read_text().splitlines()[-100000:] if x.strip()]
+        except Exception:
+            rows = []
+    st = config().get('settings', {})
+    return jsonify(learn_load_patterns(rows, st.get('learning_days', 14)))
+
+
 @app.route('/learning')
 def learning():
     rows=[]
@@ -308,8 +394,10 @@ def learning():
     for x in morning: daily[x['day']]=max(daily.get(x['day'],0),x['grid_import_w'])
     learned_peak=round(statistics.median(daily.values()),0) if len(daily)>=3 else None
     battery_plan=build_battery_plan(c, rows, snapshot())
+    load_patterns=learn_load_patterns(rows, days)
     return render_template('learning.html',cfg=c,stats=stats,count=len(recent),history_file=str(HIST),days=days,
-        morning_count=len(daily),morning_peak=learned_peak,grid_import_sign=sign,daily_peaks=daily,battery_plan=battery_plan)
+        morning_count=len(daily),morning_peak=learned_peak,grid_import_sign=sign,daily_peaks=daily,
+        battery_plan=battery_plan,load_patterns=load_patterns)
 
 @app.route('/api/plan')
 def api_plan():
@@ -691,6 +779,104 @@ def analysis_page():
 @app.route('/api/analysis')
 def api_analysis():
     return jsonify({'active_control_enabled':False,'commands_sent':False,'note':'Read-only diagnostics; estimates depend on sensor mapping, units and data coverage.','page':'/analysis'})
+
+
+
+@app.route('/api/night-plan')
+def api_night_plan():
+    """Advisory-only overnight strategy; never requests charging or inverter control."""
+    c = config()
+    rows = []
+    if HIST.exists():
+        try:
+            rows = [json.loads(line) for line in HIST.read_text().splitlines()[-100000:] if line.strip()]
+        except Exception:
+            rows = []
+    snap = snapshot()
+    plan = build_battery_plan(c, rows, snap)
+    values = (snap or {}).get('values', {})
+    soc_item = values.get('battery_soc') or {}
+    try:
+        soc = float(soc_item.get('value'))
+    except (TypeError, ValueError):
+        soc = None
+    st = c.get('settings', {})
+    capacity = max(0.0, float(st.get('battery_capacity_kwh', 80)))
+    reserve_kwh = plan.get('recommended_morning_reserve_kwh')
+    current_kwh = capacity * max(0.0, min(100.0, soc)) / 100.0 if soc is not None else None
+    gap_kwh = max(0.0, float(reserve_kwh) - current_kwh) if reserve_kwh is not None and current_kwh is not None else None
+    import_price = max(0.0, float(st.get('import_price_eur_kwh', 0.30)))
+    export_price = max(0.0, float(st.get('export_price_eur_kwh', 0.04)))
+    # Estimate overnight battery discharge from historical battery_power readings,
+    # not from house load. Normalize sign so positive means discharge. Use per-day
+    # medians per 15-minute slot and require at least 3 separate days per slot.
+    st = c.get('settings', {})
+    learned_days = max(1, int(st.get('learning_days', 14)))
+    cutoff = datetime.now(timezone.utc).timestamp() - learned_days * 86400
+    sign = st.get('battery_power_sign', 'negative')
+    slot_days = {}
+    for row in rows:
+        try:
+            ts = datetime.fromisoformat(row.get('timestamp', '').replace('Z', '+00:00')).timestamp()
+            if ts < cutoff:
+                continue
+            raw = row.get('values', {}).get('battery_power')
+            if not isinstance(raw, (int, float)) or abs(raw) > 100000:
+                continue
+            dt = datetime.fromtimestamp(ts).astimezone()
+            if not (0 <= dt.hour < morning_start):
+                continue
+            discharge_w = max(0.0, -float(raw) if sign == 'negative' else float(raw))
+            slot = dt.hour * 60 + (dt.minute // 15) * 15
+            slot_days.setdefault(slot, {}).setdefault(dt.date().isoformat(), []).append(discharge_w)
+        except (ValueError, TypeError, OverflowError):
+            continue
+    discharge_slots = []
+    for slot, by_day in slot_days.items():
+        if len(by_day) < 3:
+            continue
+        daily_medians = [statistics.median(samples) for samples in by_day.values() if samples]
+        if daily_medians:
+            discharge_slots.append({'median_w': statistics.median(daily_medians), 'days_seen': len(daily_medians)})
+    night_discharge_kwh = sum(max(0.0, p['median_w']) * 0.25 / 1000.0 for p in discharge_slots)
+    night_confidence = ('hoch' if discharge_slots and min(p['days_seen'] for p in discharge_slots) >= 7
+                        else 'mittel' if discharge_slots and min(p['days_seen'] for p in discharge_slots) >= 5
+                        else 'vorläufig' if discharge_slots else 'keine')
+    estimated_night_end_kwh = max(0.0, current_kwh - night_discharge_kwh) if current_kwh is not None and discharge_slots else None
+    reserve_gap_after_night_kwh = max(0.0, float(reserve_kwh) - estimated_night_end_kwh) if reserve_kwh is not None and estimated_night_end_kwh is not None else None
+    # A simple cost comparison is intentionally only indicative: without a time-of-use
+    # tariff and measured round-trip efficiency, it cannot prove a grid purchase is cheaper.
+    indicative_grid_cost = reserve_gap_after_night_kwh * import_price if reserve_gap_after_night_kwh is not None else None
+    indicative_export_value = reserve_gap_after_night_kwh * export_price if reserve_gap_after_night_kwh is not None else None
+    if gap_kwh is None:
+        status = 'nicht_bewertbar'
+        recommendation = 'Keine belastbare Empfehlung: SoC oder Morgenreserve fehlt. Vorzeichen und Messdaten prüfen.'
+    elif reserve_gap_after_night_kwh is not None and reserve_gap_after_night_kwh <= 0.25:
+        status = 'kein_zukauf_erforderlich'
+        recommendation = 'Unter Berücksichtigung der gelernten typischen Nachtentladung bleibt voraussichtlich genügend Energie für die Morgenreserve. Kein zusätzlicher Netzbezug empfohlen.'
+    elif reserve_gap_after_night_kwh is not None:
+        status = 'nachtreserve_luecke'
+        recommendation = (f'Bei Fortsetzung der gelernten Nachtentladung könnten bis zum Morgen etwa {reserve_gap_after_night_kwh:.1f} kWh zur Reserve fehlen. '
+                          'Zuerst prüfen, ob die Nachtentladung sinkt oder lokal begrenzt werden kann. Netzbezug nur erwägen, wenn die Reserve wichtig ist und der Tarifvergleich inklusive Speicherverlusten dafür spricht.')
+    else:
+        status = 'nachtentladung_unbekannt'
+        recommendation = 'Die Nachtentladung kann aus den vorhandenen Batterieleistungsdaten nicht zuverlässig geschätzt werden. Messhistorie und Vorzeichen-Einstellung prüfen; keine Reserveprognose ableiten.'
+    return jsonify({'mode':'advisory_only','commands_sent':False,'status':status,
+        'battery_soc_percent':soc,'current_battery_energy_kwh':round(current_kwh,2) if current_kwh is not None else None,
+        'recommended_morning_reserve_kwh':reserve_kwh,'reserve_gap_kwh':round(gap_kwh,2) if gap_kwh is not None else None,
+        'learned_night_battery_discharge_slots':len(discharge_slots),'learned_night_battery_discharge_estimate_kwh':round(night_discharge_kwh,2),
+        'learned_night_confidence':night_confidence,
+        'estimated_battery_energy_at_morning_kwh':round(estimated_night_end_kwh,2) if estimated_night_end_kwh is not None else None,
+        'estimated_reserve_gap_after_night_kwh':round(reserve_gap_after_night_kwh,2) if reserve_gap_after_night_kwh is not None else None,
+        'indicative_grid_cost_eur':round(indicative_grid_cost,2) if indicative_grid_cost is not None else None,
+        'indicative_export_value_eur':round(indicative_export_value,2) if indicative_export_value is not None else None,
+        'import_price_eur_kwh':import_price,'export_price_eur_kwh':export_price,
+        'recommendation':recommendation,
+        'limitations':['Keine automatische Netzladung und keine Wechselrichtersteuerung.',
+          'Die Nachtentladung wird aus historischen Batterieleistungswerten geschätzt; nur Zeitfenster mit mindestens drei Messtagen werden verwendet.',
+          'Bei fehlenden oder falsch konfigurierten Batterie-Vorzeichen ist keine belastbare Nachtentladungsschätzung möglich.',
+          'Preisvergleich berücksichtigt hier noch keine vollständigen Umwandlungsverluste oder zeitabhängigen Tarife.']})
+
 
 @app.route('/health')
 def health():return jsonify({'status':'ok','mode':'observe','active_control_enabled':False,'timestamp':datetime.now(timezone.utc).isoformat()})
