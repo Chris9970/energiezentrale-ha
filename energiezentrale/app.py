@@ -595,8 +595,22 @@ def analysis_page():
     peak=max(peaks,key=lambda x:x['w']) if peaks else None
     if grid_import_multiplier is None:
         alerts.append('Netzvorzeichen ist noch nicht bestätigt; Netzbezug, Einspeisung und Spitzen werden nicht zuverlässig bewertet.')
-    fv=(snap.get('values',{}).get('pv_forecast') or {}).get('value'); unit=((snap.get('values',{}).get('pv_forecast') or {}).get('unit') or c.get('sensors',{}).get('pv_forecast',{}).get('unit','Wh')).lower()
-    forecast_kwh=(float(fv)/1000 if 'wh' in unit and 'kwh' not in unit else float(fv)) if isinstance(fv,(int,float)) else None
+    forecast_obj=(snap.get('values',{}).get('pv_forecast') or {})
+    fv=forecast_obj.get('value'); unit=((forecast_obj.get('unit') or c.get('sensors',{}).get('pv_forecast',{}).get('unit','Wh'))).lower()
+    forecast_kwh=(float(fv)/1000 if 'wh' in unit and 'kwh' not in unit else float(fv)) if isinstance(fv,(int,float)) and float(fv)>=0 else None
+    forecast_mode=st.get('pv_forecast_mode','daily_total')
+    if forecast_kwh is not None and forecast_mode == 'daily_total':
+        pv_remaining_kwh=max(0.0,forecast_kwh-pv_kwh)
+        pv_projected_total_kwh=max(forecast_kwh,pv_kwh)
+        forecast_label='Tagesgesamtprognose'
+    elif forecast_kwh is not None:
+        pv_remaining_kwh=forecast_kwh
+        pv_projected_total_kwh=pv_kwh+forecast_kwh
+        forecast_label='Resttagesprognose'
+    else:
+        pv_remaining_kwh=None
+        pv_projected_total_kwh=None
+        forecast_label='Nicht verfügbar'
     # Alerts are advisory only; do not infer a fault from an unchanged value alone.
     if rejected: alerts.append(f'{rejected} Messintervalle über 120 s ausgelassen; Tagesenergie kann unterschätzt sein.')
     residual=pv_kwh+imp_kwh+discharge_kwh-load_kwh-exp_kwh-charge_kwh
@@ -657,7 +671,7 @@ def analysis_page():
     if soc_energy_gap is not None and abs(soc_energy_gap)>max(5.0,capacity*0.15): alerts.append('SoC-Änderung und integrierte Batterieleistung weichen deutlich ab; AC/DC-Messpunkt und SoC-Sensor prüfen.')
     # Existing consumer plan is displayed as advisory; no entity writes exist in this route.
     consumers=c.get('consumers',[])
-    return render_template('analysis.html',cfg=c,day=today,energy={'pv':pv_kwh,'load':load_kwh,'import':imp_kwh,'export':exp_kwh,'charge':charge_kwh,'discharge':discharge_kwh,'residual':residual,'residual_pct':residual_pct},peak=peak,peak_count=len(peaks),peak_events=peak_events,soc_start=soc_first,soc_end=soc_last,soc_now=battery_soc_now,soc_delta_kwh=soc_delta_kwh,soc_energy_gap=soc_energy_gap,history_days=history_days,forecast_kwh=forecast_kwh,forecast_age=(snap.get('values',{}).get('pv_forecast') or {}).get('updated'),costs=costs,revenue=revenue,price=price,export_price=export_price,alerts=alerts,consumers=consumers,samples=len(today_rows),accepted=accepted,rejected=rejected,active_control_enabled=False)
+    return render_template('analysis.html',cfg=c,day=today,energy={'pv':pv_kwh,'load':load_kwh,'import':imp_kwh,'export':exp_kwh,'charge':charge_kwh,'discharge':discharge_kwh,'residual':residual,'residual_pct':residual_pct},peak=peak,peak_count=len(peaks),peak_events=peak_events,soc_start=soc_first,soc_end=soc_last,soc_now=battery_soc_now,soc_delta_kwh=soc_delta_kwh,soc_energy_gap=soc_energy_gap,history_days=history_days,forecast_kwh=forecast_kwh,forecast_age=(snap.get('values',{}).get('pv_forecast') or {}).get('updated'),forecast_label=forecast_label,pv_remaining_kwh=pv_remaining_kwh,pv_projected_total_kwh=pv_projected_total_kwh,costs=costs,revenue=revenue,price=price,export_price=export_price,alerts=alerts,consumers=consumers,samples=len(today_rows),accepted=accepted,rejected=rejected,active_control_enabled=False)
 
 @app.route('/api/analysis')
 def api_analysis():

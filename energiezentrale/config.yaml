@@ -1,5 +1,5 @@
 name: "Energiezentrale"
-version: "1.1.3"
+version: "1.1.4"
 slug: "energiezentrale"
 description: "Energiezentrale 1.1.3 mit interpretierbarer PV-Tages- oder Restprognose; nur lesend"
 arch: [aarch64, amd64]
