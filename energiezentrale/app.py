@@ -4,7 +4,35 @@ from pathlib import Path
 from flask import Flask,render_template,request,redirect,url_for,flash,jsonify
 import requests
 app=Flask(__name__); app.secret_key='local-energy-app'
-DATA=Path('/data'); DATA.mkdir(exist_ok=True); CFG=DATA/'config.json'; HIST=DATA/'history.jsonl'
+DATA=Path('/data'); DATA.mkdir(exist_ok=True); CFG=DATA/'config.json'; HIST=DATA/'history.jsonl'; LEARN_STATE=DATA/'learning_state.json'
+
+def learning_start_timestamp():
+    """Persist the start of the new learning period; old history is excluded."""
+    try:
+        state=json.loads(LEARN_STATE.read_text()); value=float(state['started_at'])
+        if value > 0: return value
+    except Exception: pass
+    value=time.time()
+    try:
+        tmp=LEARN_STATE.with_suffix('.tmp')
+        tmp.write_text(json.dumps({'started_at':value,'started_at_iso':datetime.fromtimestamp(value,timezone.utc).isoformat(),'policy':'new_samples_only'}))
+        tmp.replace(LEARN_STATE)
+    except Exception: pass
+    return value
+
+def learning_rows(limit=100000):
+    """Return only samples recorded since this learning feature was first activated."""
+    started=learning_start_timestamp()
+    if not HIST.exists(): return []
+    rows=[]
+    try:
+        for line in HIST.read_text().splitlines()[-limit:]:
+            if not line.strip(): continue
+            try: row=json.loads(line); ts=datetime.fromisoformat(row.get('timestamp','').replace('Z','+00:00')).timestamp()
+            except Exception: continue
+            if ts >= started: rows.append(row)
+    except Exception: return []
+    return rows
 DEFAULT={'plant_name':'Meine Energiezentrale','sensors':{
 'pv_power':{'label':'PV-Leistung','entity_id':'sensor.sofar_speicher_pv_power_total','unit':'W'},
 'load_power':{'label':'Hausverbrauch','entity_id':'sensor.sofar_speicher_active_power_load_sys','unit':'W'},
@@ -14,7 +42,7 @@ DEFAULT={'plant_name':'Meine Energiezentrale','sensors':{
 'inverter_output':{'label':'Wechselrichter-Ausgangsleistung','entity_id':'sensor.sofar_speicher_active_power_output_total','unit':'W'},
 'pv_forecast':{'label':'PV-Prognose','entity_id':'sensor.solcast_pv_forecast_prognose_heute','unit':'Wh'}},
 'consumers':[{'id':'heater','name':'Elektroheizung','type':'heater','enabled':True,'nominal_power_w':30000,'stages_w':[7500,15000,22500,30000],'priority':1},{'id':'compressor','name':'Kompressor','type':'motor','enabled':True,'nominal_power_w':11000,'stages_w':[],'priority':2}],
-'control_entities':{'mode':'select.sofar_speicher_inverter_energy_storage_mode','grid_setpoint':'number.sofar_speicher_inverter_passive_desired_grid_power','charge_power':'number.sofar_speicher_inverter_passive_maximum_battery_power','discharge_power':'number.sofar_speicher_inverter_passive_minimum_battery_power','apply_button':'button.sofar_speicher_inverter_passive_update_battery_charge_discharge'},'settings':{'grid_import_limit_w':5000,'battery_reserve_percent':25,'inverter_count':2,'control_enabled':False,'mode':'observe','grid_setpoint_sign':'unverified','grid_import_sign':'unverified','battery_power_sign':'negative','morning_start_hour':5,'morning_end_hour':9,'learning_days':14,'morning_min_samples_per_day':60,'battery_capacity_kwh':80,'battery_discharge_power_kw':30,'silage_slots':['06:30','12:00','18:00'],'silage_flex_minutes':45,'silage_duration_minutes':15,'feeding_slots':['06:45','12:00','18:15'],'feeding_flex_minutes':10,'feeding_duration_minutes':8,'feeding_power_w':0,'consumer_surplus_margin_w':1000,'import_price_eur_kwh':0.30,'export_price_eur_kwh':0.04,'peak_alert_w':5000,'balance_alert_pct':15,'pv_forecast_mode':'daily_total'}}
+'control_entities':{'mode':'select.sofar_speicher_inverter_energy_storage_mode','grid_setpoint':'number.sofar_speicher_inverter_passive_desired_grid_power','charge_power':'number.sofar_speicher_inverter_passive_maximum_battery_power','discharge_power':'number.sofar_speicher_inverter_passive_minimum_battery_power','apply_button':'button.sofar_speicher_inverter_passive_update_battery_charge_discharge'},'settings':{'grid_import_limit_w':5000,'battery_reserve_percent':25,'inverter_count':2,'control_enabled':False,'mode':'observe','grid_setpoint_sign':'unverified','grid_import_sign':'unverified','battery_power_sign':'negative','morning_start_hour':5,'morning_end_hour':9,'learning_days':14,'morning_min_samples_per_day':60,'battery_capacity_kwh':80,'battery_discharge_power_kw':30,'silage_slots':['06:30','12:00','18:00'],'silage_flex_minutes':45,'silage_duration_minutes':15,'feeding_slots':['06:45','12:00','18:15'],'feeding_flex_minutes':10,'feeding_duration_minutes':8,'feeding_power_w':0,'consumer_surplus_margin_w':1000,'import_price_eur_kwh':0.30,'export_price_eur_kwh':0.04,'tariff_effective_month':'','tariff_history':[],'battery_roundtrip_efficiency':0.90,'peak_alert_w':5000,'balance_alert_pct':15,'pv_forecast_mode':'daily_total'}}
 def config():
  if not CFG.exists(): CFG.write_text(json.dumps(DEFAULT,ensure_ascii=False,indent=2))
  try:
@@ -259,8 +287,20 @@ def config_page():
    c['settings']['morning_end_hour']=max(1,min(24,int(request.form.get('morning_end_hour','9'))))
    c['settings']['grid_import_sign']=request.form.get('grid_import_sign','unverified') if request.form.get('grid_import_sign','unverified') in ('positive','negative','unverified') else 'unverified'
    c['settings']['battery_power_sign']=request.form.get('battery_power_sign','negative') if request.form.get('battery_power_sign','negative') in ('positive','negative') else 'negative'
-   c['settings']['import_price_eur_kwh']=max(0,min(5,float(request.form.get('import_price_eur_kwh','0.30'))))
-   c['settings']['export_price_eur_kwh']=max(0,min(5,float(request.form.get('export_price_eur_kwh','0.04'))))
+   import_price=max(0,min(5,float(request.form.get('import_price_eur_kwh','0.30'))))
+   export_price=max(0,min(5,float(request.form.get('export_price_eur_kwh','0.04'))))
+   effective_month=request.form.get('tariff_effective_month','').strip()
+   if effective_month and (len(effective_month)!=7 or effective_month[4]!='-' or not effective_month[:4].isdigit() or not effective_month[5:7].isdigit() or not 1<=int(effective_month[5:7])<=12):
+    raise ValueError('Gültigkeitsmonat muss im Format JJJJ-MM angegeben werden.')
+   c['settings']['import_price_eur_kwh']=import_price
+   c['settings']['export_price_eur_kwh']=export_price
+   c['settings']['tariff_effective_month']=effective_month
+   c['settings']['battery_roundtrip_efficiency']=max(0.50,min(1.0,(float(request.form.get('battery_roundtrip_efficiency','90'))/100.0)))
+   if effective_month:
+    history=c['settings'].setdefault('tariff_history',[])
+    entry={'month':effective_month,'import_price_eur_kwh':import_price,'export_price_eur_kwh':export_price}
+    history[:]=[x for x in history if x.get('month')!=effective_month]
+    history.append(entry); history.sort(key=lambda x:x.get('month',''))
    c['settings']['peak_alert_w']=max(500,int(request.form.get('peak_alert_w','5000')))
    c['settings']['balance_alert_pct']=max(1,min(100,float(request.form.get('balance_alert_pct','15'))))
    c['settings']['pv_forecast_mode']=request.form.get('pv_forecast_mode','daily_total') if request.form.get('pv_forecast_mode','daily_total') in ('daily_total','remaining') else 'daily_total'
@@ -351,22 +391,17 @@ def learn_load_patterns(rows, days=14, min_power_w=1000, min_days=3):
 
 @app.route('/api/learned-load-patterns')
 def api_learned_load_patterns():
-    rows = []
-    if HIST.exists():
-        try:
-            rows = [json.loads(x) for x in HIST.read_text().splitlines()[-100000:] if x.strip()]
-        except Exception:
-            rows = []
+    rows = learning_rows()
     st = config().get('settings', {})
-    return jsonify(learn_load_patterns(rows, st.get('learning_days', 14)))
+    result = learn_load_patterns(rows, st.get('learning_days', 14))
+    result['learning_started_at'] = datetime.fromtimestamp(learning_start_timestamp(), timezone.utc).isoformat()
+    result['historical_statistics_used'] = False
+    return jsonify(result)
 
 
 @app.route('/learning')
 def learning():
-    rows=[]
-    if HIST.exists():
-        try: rows=[json.loads(x) for x in HIST.read_text().splitlines()[-100000:] if x.strip()]
-        except Exception: rows=[]
+    rows=learning_rows()
     now=datetime.now(timezone.utc)
     days=int(config().get('settings',{}).get('learning_days',14))
     cutoff=now.timestamp()-days*86400
@@ -395,7 +430,7 @@ def learning():
     learned_peak=round(statistics.median(daily.values()),0) if len(daily)>=3 else None
     battery_plan=build_battery_plan(c, rows, snapshot())
     load_patterns=learn_load_patterns(rows, days)
-    return render_template('learning.html',cfg=c,stats=stats,count=len(recent),history_file=str(HIST),days=days,
+    return render_template('learning.html',cfg=c,stats=stats,count=len(recent),history_file=str(HIST),days=days, learning_started_at=datetime.fromtimestamp(learning_start_timestamp(),timezone.utc).astimezone().strftime('%d.%m.%Y %H:%M'),
         morning_count=len(daily),morning_peak=learned_peak,grid_import_sign=sign,daily_peaks=daily,
         battery_plan=battery_plan,load_patterns=load_patterns)
 
@@ -492,9 +527,9 @@ def api_battery_plan():
 
 @app.route('/api/peak-analysis')
 def api_peak_analysis():
-    """Historical soft-grid-target analysis; respects actual timestamp gaps."""
+    """Advisory peak analysis with estimated excess energy; never extrapolates gaps."""
     c=config(); st=c.get('settings',{}); sign=st.get('grid_import_sign','unverified')
-    target=max(0,float(st.get('grid_import_limit_w',5000)))
+    target=max(0.0,float(st.get('peak_alert_w', st.get('grid_import_limit_w',5000))))
     days=max(1,min(90,int(st.get('learning_days',14))))
     rows=[]
     if HIST.exists():
@@ -508,19 +543,105 @@ def api_peak_analysis():
             raw=row.get('values',{}).get('grid_power')
             if ts<cutoff or not isinstance(raw,(int,float)): continue
             imp=(-float(raw) if sign=='negative' else float(raw) if sign=='positive' else None)
-            if imp is not None: samples.append((ts,max(0,imp)))
+            if imp is not None:
+                battery_raw=row.get('values',{}).get('battery_power')
+                battery_sign=st.get('battery_power_sign','negative')
+                if isinstance(battery_raw,(int,float)) and battery_sign in ('negative','positive'):
+                    battery_discharge=max(0.0, -float(battery_raw) if battery_sign=='negative' else float(battery_raw))
+                else: battery_discharge=None
+                samples.append((ts,max(0.0,imp),battery_discharge))
         except Exception: continue
     samples.sort(); daily={}; over_count=0; max_gap=max(30,int(os.getenv('SAMPLE_INTERVAL_SECONDS','15'))*2)
-    for i,(ts,w) in enumerate(samples):
+    excess_kwh=peak_import_kwh=0.0; valid_intervals=0; events=[]; active=None
+    for i,(ts,w,batt_w) in enumerate(samples):
         day=datetime.fromtimestamp(ts).astimezone().date().isoformat()
-        d=daily.setdefault(day,{'peak_w':0,'samples_over_target':0,'estimated_minutes_over_target':0.0})
-        d['peak_w']=max(d['peak_w'],round(w));
+        d=daily.setdefault(day,{'peak_w':0,'samples_over_target':0,'estimated_minutes_over_target':0.0,'excess_energy_kwh':0.0})
+        d['peak_w']=max(d['peak_w'],round(w))
         if w>target:
             over_count+=1; d['samples_over_target']+=1
-            if i+1<len(samples) and samples[i+1][0]-ts<=max_gap:
-                d['estimated_minutes_over_target']+=(samples[i+1][0]-ts)/60.0
-    return jsonify({'mode':'advisory_only','commands_sent':False,'target_w':target,'sign':sign,'days_requested':days,'valid_samples':len(samples),'samples_over_target':over_count,'daily':daily,'warning':'Dauer oberhalb des Ziels ist nur eine Schätzung aus benachbarten Messpunkten; Datenlücken werden nicht hochgerechnet.' if sign!='unverified' else 'Netzleistungs-Vorzeichen zuerst in der Konfiguration bestätigen.'})
+            if active is None: active={'start':ts,'end':ts,'max_w':w,'excess_kwh':0.0,'import_kwh':0.0,'battery_offset_kwh':0.0,'battery_data_intervals':0,'samples':1}
+            else: active['end']=ts; active['max_w']=max(active['max_w'],w); active['samples']+=1
+        if i+1<len(samples):
+            t2,w2,batt_w2=samples[i+1]; dt=t2-ts
+            if 0<dt<=max_gap:
+                valid_intervals+=1
+                # Trapezoidal integration over the observed interval only.
+                excess=max(0.0,w-target); excess2=max(0.0,w2-target)
+                e=(excess+excess2)*0.5*dt/3600000.0
+                if batt_w is not None and batt_w2 is not None:
+                    offset=(min(excess,batt_w)+min(excess2,batt_w2))*0.5*dt/3600000.0
+                else: offset=None
+                imp_e=(w+w2)*0.5*dt/3600000.0 if (w>target or w2>target) else 0.0
+                if w>target or w2>target:
+                    excess_kwh+=e; peak_import_kwh+=imp_e
+                    d['excess_energy_kwh']+=e
+                    if active is not None:
+                        active['excess_kwh']+=e; active['import_kwh']+=imp_e
+                        if offset is not None:
+                            active['battery_offset_kwh']+=offset; active['battery_data_intervals']+=1
+                if active is not None and w2<=target and w<=target:
+                    events.append(active); active=None
+                elif active is not None and w2<=target:
+                    active['end']=t2; events.append(active); active=None
+            elif active is not None:
+                # Do not bridge a data gap; end the event at the last known sample.
+                events.append(active); active=None
+    if active is not None: events.append(active)
+    for d in daily.values(): d['excess_energy_kwh']=round(d['excess_energy_kwh'],3)
+    for d in daily.values(): d['estimated_minutes_over_target']=round(d['samples_over_target']*max_gap/60.0,1)
+    top_events=[]
+    for e in sorted(events,key=lambda x:x['max_w'],reverse=True)[:20]:
+        top_events.append({'start':datetime.fromtimestamp(e['start']).astimezone().isoformat(timespec='minutes'),
+          'end':datetime.fromtimestamp(e['end']).astimezone().isoformat(timespec='minutes'),
+          'duration_min':round(max(0,e['end']-e['start'])/60,1),'max_w':round(e['max_w']),
+          'excess_energy_kwh':round(e['excess_kwh'],3),'grid_import_energy_kwh_during_event':round(e['import_kwh'],3),'estimated_peak_reduction_if_battery_discharge_was_available_kwh':round(e['battery_offset_kwh'],3),'battery_data_intervals':e['battery_data_intervals'],'samples':e['samples']})
+    return jsonify({'mode':'advisory_only','commands_sent':False,'target_w':target,'sign':sign,'days_requested':days,
+      'valid_samples':len(samples),'valid_intervals':valid_intervals,'samples_over_target':over_count,
+      'estimated_excess_energy_kwh':round(excess_kwh,3),'estimated_grid_import_energy_during_peak_intervals_kwh':round(peak_import_kwh,3),
+      'estimated_peak_reduction_if_battery_discharge_was_available_kwh':round(sum(e['battery_offset_kwh'] for e in events),3),
+      'battery_data_coverage_intervals':sum(e['battery_data_intervals'] for e in events),
+      'peak_events_count':len(events),'top_peak_events':top_events,'daily':daily,
+      'warning':'Energie ist aus benachbarten Messpunkten trapezförmig geschätzt; Zeitlücken werden nicht überbrückt. Importenergie während Peak-Intervallen ist nicht gleich vermeidbare Energie. Netz-Vorzeichen prüfen.' if sign in ('negative','positive') else 'Netzleistungs-Vorzeichen zuerst in der Konfiguration bestätigen.'})
 
+
+def economic_assessment(import_price_eur_kwh, export_price_eur_kwh, roundtrip_efficiency=0.90):
+    """Marginal value of using stored battery energy instead of exporting it.
+    Advisory only; efficiency is a user-configured estimate, not a measured value.
+    """
+    buy=max(0.0,min(5.0,float(import_price_eur_kwh)))
+    sell=max(0.0,min(5.0,float(export_price_eur_kwh)))
+    eta=max(0.50,min(1.0,float(roundtrip_efficiency)))
+    export_opportunity_cost=sell/eta
+    net=buy-export_opportunity_cost
+    return {'import_price_eur_kwh':round(buy,4),'export_price_eur_kwh':round(sell,4),
+            'roundtrip_efficiency':eta,'export_opportunity_cost_eur_per_delivered_kwh':round(export_opportunity_cost,4),
+            'net_benefit_eur_per_delivered_kwh':round(net,4),
+            'net_benefit_cent_per_delivered_kwh':round(net*100,2),
+            'recommendation':'Speichern und später selbst nutzen ist preislich vorteilhaft (ohne Alterungskosten).' if net>0.005 else ('Einspeisen ist preislich mindestens gleichwertig; Speicherverluste sprechen eher gegen Laden nur für späteren Eigenverbrauch.' if net < -0.005 else 'Beide Wege sind preislich ungefähr gleichwertig; Verluste und Alterung beachten.'),
+            'advisory_only':True}
+
+def active_tariff(settings, current_month=None):
+    """Choose the latest saved tariff whose effective month is not in the future."""
+    month = current_month or datetime.now().strftime('%Y-%m')
+    history = settings.get('tariff_history', [])
+    eligible = [x for x in history if isinstance(x, dict) and isinstance(x.get('month'), str) and len(x['month']) == 7 and x['month'] <= month]
+    if eligible:
+        chosen = max(eligible, key=lambda x: x['month'])
+        return {'month': chosen['month'], 'import_price_eur_kwh': float(chosen.get('import_price_eur_kwh', settings.get('import_price_eur_kwh', 0.30))), 'export_price_eur_kwh': float(chosen.get('export_price_eur_kwh', settings.get('export_price_eur_kwh', 0.04))), 'source': 'history'}
+    return {'month': settings.get('tariff_effective_month') or '', 'import_price_eur_kwh': float(settings.get('import_price_eur_kwh', 0.30)), 'export_price_eur_kwh': float(settings.get('export_price_eur_kwh', 0.04)), 'source': 'current_settings'}
+
+@app.route('/economics')
+def economics_page():
+    c=config(); st=c.get('settings',{}); tariff=active_tariff(st)
+    assessment=economic_assessment(tariff['import_price_eur_kwh'],tariff['export_price_eur_kwh'],st.get('battery_roundtrip_efficiency',0.90))
+    return render_template('economics.html',cfg=c,assessment=assessment,history=st.get('tariff_history',[]),tariff=tariff)
+
+@app.route('/api/economic-assessment')
+def api_economic_assessment():
+    st=config().get('settings',{}); tariff=active_tariff(st)
+    result=economic_assessment(tariff['import_price_eur_kwh'],tariff['export_price_eur_kwh'],st.get('battery_roundtrip_efficiency',0.90))
+    result['applied_tariff_month']=tariff['month']; result['tariff_source']=tariff['source']
+    return jsonify(result)
 
 @app.route('/diagnostics')
 def diagnostics():
@@ -786,12 +907,7 @@ def api_analysis():
 def api_night_plan():
     """Advisory-only overnight strategy; never requests charging or inverter control."""
     c = config()
-    rows = []
-    if HIST.exists():
-        try:
-            rows = [json.loads(line) for line in HIST.read_text().splitlines()[-100000:] if line.strip()]
-        except Exception:
-            rows = []
+    rows = learning_rows()
     snap = snapshot()
     plan = build_battery_plan(c, rows, snap)
     values = (snap or {}).get('values', {})
