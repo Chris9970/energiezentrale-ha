@@ -517,12 +517,12 @@ def energy_report_page():
     forecast_mode=c.get('settings',{}).get('pv_forecast_mode','daily_total')
     if forecast_kwh is not None and forecast_kwh < 0: forecast_kwh=None
     if forecast_kwh is not None and forecast_mode == 'daily_total':
-        pv_remaining_kwh=max(0.0,forecast_kwh-today_data['pv'])
-        pv_projected_total_kwh=max(forecast_kwh,today_data['pv'])
+        pv_remaining_kwh=max(0.0,forecast_kwh-today_data['pv_kwh'])
+        pv_projected_total_kwh=max(forecast_kwh,today_data['pv_kwh'])
         forecast_label='Tagesgesamtprognose'
     elif forecast_kwh is not None:
         pv_remaining_kwh=forecast_kwh
-        pv_projected_total_kwh=today_data['pv']+forecast_kwh
+        pv_projected_total_kwh=today_data['pv_kwh']+forecast_kwh
         forecast_label='Resttagesprognose'
     else:
         pv_remaining_kwh=None; pv_projected_total_kwh=None; forecast_label='Nicht verfügbar'
