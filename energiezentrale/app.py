@@ -22,6 +22,12 @@ def config():
   for k,v in DEFAULT['sensors'].items(): c['sensors'].setdefault(k,v)
   c.setdefault('consumers',DEFAULT['consumers']); c.setdefault('settings',{}); c.setdefault('control_entities',DEFAULT['control_entities'])
   for k,v in DEFAULT['settings'].items(): c['settings'].setdefault(k,v)
+  # Migrate the known mistaken 30 kW grid-import target to the intended soft target of 5 kW.
+  # This affects only the advisory setting; no device commands are sent.
+  if c['settings'].get('grid_import_limit_w') == 30000:
+   c['settings']['grid_import_limit_w'] = 5000
+   try: save(c)
+   except Exception: pass
   for k,v in DEFAULT['control_entities'].items(): c['control_entities'].setdefault(k,v)
   return c
  except Exception: return json.loads(json.dumps(DEFAULT))
@@ -83,15 +89,36 @@ def build_battery_plan(c, rows, snap=None):
             daily.setdefault(dt.date().isoformat(), []).append(max(0.0, imp))
         except Exception:
             continue
-    # Estimate energy needed above the soft target, using sampled time intervals.
-    # Missing intervals are conservatively not extrapolated.
+    # Integrate excess energy only across adjacent, sufficiently close samples.
+    # Long gaps are not extrapolated, avoiding a falsely precise reserve estimate.
     daily_excess_kwh = {}
-    daily_peak_w = {}
-    for day, vals in daily.items():
-        daily_peak_w[day] = max(vals) if vals else 0.0
-        # Approximate energy above target using the configured sample interval.
-        step_h = max(5, int(os.getenv('SAMPLE_INTERVAL_SECONDS','15'))) / 3600.0
-        daily_excess_kwh[day] = sum(max(0.0, v-target_w) for v in vals) * step_h / 1000.0
+    daily_peak_w = {day: max(vals) if vals else 0.0 for day, vals in daily.items()}
+    samples_by_day = {}
+    for row in rows:
+        try:
+            ts = datetime.fromisoformat(row.get('timestamp','').replace('Z','+00:00')).timestamp()
+            if ts < cutoff: continue
+            dt = datetime.fromtimestamp(ts).astimezone()
+            if not (morning_start <= dt.hour < morning_end): continue
+            raw = row.get('values', {}).get('grid_power')
+            if not isinstance(raw, (int,float)): continue
+            imp = (-float(raw) if sign == 'negative' else float(raw) if sign == 'positive' else None)
+            if imp is None: continue
+            samples_by_day.setdefault(dt.date().isoformat(), []).append((ts, max(0.0, imp)))
+        except Exception:
+            continue
+    sample_s = max(5, int(os.getenv('SAMPLE_INTERVAL_SECONDS','15')))
+    for day, points in samples_by_day.items():
+        points.sort()
+        energy = 0.0
+        for (t0, p0), (t1, p1) in zip(points, points[1:]):
+            dt_s = t1 - t0
+            if 0 < dt_s <= sample_s * 2.5:
+                # Trapezoid integration of power above the soft grid target.
+                a = max(0.0, p0 - target_w)
+                b = max(0.0, p1 - target_w)
+                energy += ((a + b) / 2.0) * dt_s / 3600.0 / 1000.0
+        daily_excess_kwh[day] = energy
     enough = len(daily) >= 3
     peak_median = statistics.median(daily_peak_w.values()) if enough else None
     excess_median = statistics.median(daily_excess_kwh.values()) if enough else None
@@ -152,7 +179,7 @@ def simulation():
   except Exception: rows=[]
  battery=build_battery_plan(c,rows,snap)
  missing=[c.get('sensors',{}).get(k,{}).get('label',k) for k in ('pv_power','load_power','grid_power','battery_soc') if not isinstance(vals.get(k),(int,float))]
- return render_template('simulation.html',cfg=c,snap=snap,vals=vals,grid_import=grid_import,surplus=surplus,battery=battery,missing=missing,history_count=len(rows))
+ return render_template('simulation.html',cfg=c,snap=snap,vals=vals,grid_import=grid_import,surplus=surplus,battery=battery,missing=missing,history_count=len(rows),sign=sign)
 
 @app.route('/api/snapshot')
 def api_snapshot():return jsonify(snapshot())
