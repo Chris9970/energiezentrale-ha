@@ -935,6 +935,7 @@ def api_night_plan():
     st = c.get('settings', {})
     learned_days = max(1, int(st.get('learning_days', 14)))
     cutoff = datetime.now(timezone.utc).timestamp() - learned_days * 86400
+    morning_start = max(0, min(23, int(st.get('morning_start_hour', 5))))
     sign = st.get('battery_power_sign', 'negative')
     slot_days = {}
     for row in rows:
