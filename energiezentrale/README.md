@@ -31,3 +31,10 @@
 - Fehlende Messwerte werden als fehlend angezeigt.
 - Simulation ist rein beratend; es werden keine Steuerbefehle gesendet.
 - Vollständiger Laufzeit-/Browser-Test muss in Home Assistant erfolgen.
+
+
+## Version 0.6.0 – Analyse-Erweiterung
+- Neue Seite „Diagnose & Bilanz“ mit Sensorstatus, Alter der Messwerte, Historienumfang und grober PV-minus-Last-Näherung.
+- Neue read-only API `/api/energy-report` mit Durchschnittsleistungen der letzten 24 Stunden (keine kWh-Integration).
+- Bestehende Morgenreserve bleibt beratend und benötigt mindestens drei Morgen mit gültigen Daten.
+- Aktive Steuerung ist fest deaktiviert; es werden keine Befehle an Wechselrichter oder Verbraucher gesendet.

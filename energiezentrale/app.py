@@ -404,6 +404,56 @@ def api_peak_analysis():
                 d['estimated_minutes_over_target']+=(samples[i+1][0]-ts)/60.0
     return jsonify({'mode':'advisory_only','commands_sent':False,'target_w':target,'sign':sign,'days_requested':days,'valid_samples':len(samples),'samples_over_target':over_count,'daily':daily,'warning':'Dauer oberhalb des Ziels ist nur eine Schätzung aus benachbarten Messpunkten; Datenlücken werden nicht hochgerechnet.' if sign!='unverified' else 'Netzleistungs-Vorzeichen zuerst in der Konfiguration bestätigen.'})
 
+
+@app.route('/diagnostics')
+def diagnostics():
+    c=config(); snap=snapshot(); vals={k:((v or {}).get('value')) for k,v in snap.get('values',{}).items()}
+    rows=[]
+    if HIST.exists():
+        try: rows=[json.loads(x) for x in HIST.read_text().splitlines()[-100000:] if x.strip()]
+        except Exception: rows=[]
+    now=datetime.now().astimezone(); cutoff=now.timestamp()-86400
+    recent=[]; days=set(); gaps=0; prev=None
+    for row in rows:
+        try:
+            ts=datetime.fromisoformat(row.get('timestamp','').replace('Z','+00:00')).timestamp()
+            if ts>=cutoff: recent.append(row)
+            days.add(datetime.fromtimestamp(ts).astimezone().date().isoformat())
+            if prev is not None and ts-prev>max(60, int(os.getenv('SAMPLE_INTERVAL_SECONDS','15'))*4): gaps+=1
+            prev=ts
+        except Exception: pass
+    sensors=[]
+    for key,meta in c.get('sensors',{}).items():
+        v=(snap.get('values',{}).get(key) or {})
+        age=None
+        try: age=max(0,int((now-datetime.fromisoformat(v['updated'].replace('Z','+00:00')).astimezone()).total_seconds()))
+        except Exception: pass
+        value=v.get('value'); status='OK' if value is not None else 'Fehlt / nicht numerisch'
+        if age is not None and age>300: status='Veraltet'
+        sensors.append({'label':meta.get('label',key),'entity_id':meta.get('entity_id',''),'value':value,'unit':v.get('unit',''),'age':age,'status':status})
+    # Compare PV and load without claiming a full physical balance.
+    pv=vals.get('pv_power'); load=vals.get('load_power'); grid=vals.get('grid_power'); bat=vals.get('battery_power')
+    balance=(pv-load) if isinstance(pv,(int,float)) and isinstance(load,(int,float)) else None
+    battery=build_battery_plan(c,rows,snap)
+    return render_template('diagnostics.html',cfg=c,sensors=sensors,history_count=len(rows),recent_count=len(recent),days=len(days),gaps=gaps,balance=balance,vals=vals,battery=battery)
+
+@app.route('/api/energy-report')
+def api_energy_report():
+    c=config(); rows=[]
+    if HIST.exists():
+        try: rows=[json.loads(x) for x in HIST.read_text().splitlines()[-100000:] if x.strip()]
+        except Exception: rows=[]
+    now=datetime.now().astimezone(); start=now.timestamp()-86400; data=[]
+    for r in rows:
+        try:
+            ts=datetime.fromisoformat(r.get('timestamp','').replace('Z','+00:00')).timestamp()
+            if ts>=start:data.append(r)
+        except Exception: pass
+    def avg(k):
+        x=[r.get('values',{}).get(k) for r in data if isinstance(r.get('values',{}).get(k),(int,float))]
+        return round(sum(x)/len(x),1) if x else None
+    return jsonify({'period':'last_24_hours','samples':len(data),'average_power_w':{'pv':avg('pv_power'),'load':avg('load_power'),'grid_raw':avg('grid_power'),'battery':avg('battery_power')},'note':'Durchschnittsleistungen, keine kWh-Energieintegration. Grid-Vorzeichen gemäß Konfiguration: '+str(c.get('settings',{}).get('grid_import_sign','unverified')),'active_control_enabled':False,'commands_sent':False})
+
 @app.route('/health')
 def health():return jsonify({'status':'ok','mode':'observe','active_control_enabled':False,'timestamp':datetime.now(timezone.utc).isoformat()})
 if __name__=='__main__':
