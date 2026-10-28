@@ -14,7 +14,7 @@ DEFAULT={'plant_name':'Meine Energiezentrale','sensors':{
 'inverter_output':{'label':'Wechselrichter-Ausgangsleistung','entity_id':'sensor.sofar_speicher_active_power_output_total','unit':'W'},
 'pv_forecast':{'label':'PV-Prognose','entity_id':'sensor.solcast_pv_forecast_prognose_heute','unit':'Wh'}},
 'consumers':[{'id':'heater','name':'Elektroheizung','type':'heater','enabled':True,'nominal_power_w':30000,'stages_w':[7500,15000,22500,30000],'priority':1},{'id':'compressor','name':'Kompressor','type':'motor','enabled':True,'nominal_power_w':11000,'stages_w':[],'priority':2}],
-'control_entities':{'mode':'select.sofar_speicher_inverter_energy_storage_mode','grid_setpoint':'number.sofar_speicher_inverter_passive_desired_grid_power','charge_power':'number.sofar_speicher_inverter_passive_maximum_battery_power','discharge_power':'number.sofar_speicher_inverter_passive_minimum_battery_power','apply_button':'button.sofar_speicher_inverter_passive_update_battery_charge_discharge'},'settings':{'grid_import_limit_w':5000,'battery_reserve_percent':25,'inverter_count':2,'control_enabled':False,'mode':'observe','grid_setpoint_sign':'unverified','grid_import_sign':'unverified','morning_start_hour':5,'morning_end_hour':9,'learning_days':14,'battery_capacity_kwh':80,'battery_discharge_power_kw':30,'silage_slots':['06:30','12:00','18:00'],'silage_flex_minutes':45,'silage_duration_minutes':15,'feeding_slots':['06:45','12:00','18:15'],'feeding_flex_minutes':10,'feeding_duration_minutes':8,'feeding_power_w':0,'consumer_surplus_margin_w':1000,'import_price_eur_kwh':0.30,'export_price_eur_kwh':0.04,'peak_alert_w':5000,'balance_alert_pct':15}}
+'control_entities':{'mode':'select.sofar_speicher_inverter_energy_storage_mode','grid_setpoint':'number.sofar_speicher_inverter_passive_desired_grid_power','charge_power':'number.sofar_speicher_inverter_passive_maximum_battery_power','discharge_power':'number.sofar_speicher_inverter_passive_minimum_battery_power','apply_button':'button.sofar_speicher_inverter_passive_update_battery_charge_discharge'},'settings':{'grid_import_limit_w':5000,'battery_reserve_percent':25,'inverter_count':2,'control_enabled':False,'mode':'observe','grid_setpoint_sign':'unverified','grid_import_sign':'unverified','battery_power_sign':'negative','morning_start_hour':5,'morning_end_hour':9,'learning_days':14,'morning_min_samples_per_day':60,'battery_capacity_kwh':80,'battery_discharge_power_kw':30,'silage_slots':['06:30','12:00','18:00'],'silage_flex_minutes':45,'silage_duration_minutes':15,'feeding_slots':['06:45','12:00','18:15'],'feeding_flex_minutes':10,'feeding_duration_minutes':8,'feeding_power_w':0,'consumer_surplus_margin_w':1000,'import_price_eur_kwh':0.30,'export_price_eur_kwh':0.04,'peak_alert_w':5000,'balance_alert_pct':15,'pv_forecast_mode':'daily_total'}}
 def config():
  if not CFG.exists(): CFG.write_text(json.dumps(DEFAULT,ensure_ascii=False,indent=2))
  try:
@@ -119,7 +119,14 @@ def build_battery_plan(c, rows, snap=None):
                 b = max(0.0, p1 - target_w)
                 energy += ((a + b) / 2.0) * dt_s / 3600.0 / 1000.0
         daily_excess_kwh[day] = energy
-    enough = len(daily) >= 3
+    # Reject days with too few points: a handful of samples must not look like a complete morning.
+    # At the default 15 s sampling interval, 60 points represent only 15 minutes; this is a
+    # conservative minimum-data gate, not a claim of full-window coverage.
+    min_points_per_day = max(30, int(st.get('morning_min_samples_per_day', 60)))
+    valid_days = {day for day, points in samples_by_day.items() if len(points) >= min_points_per_day}
+    daily_peak_w = {day: daily_peak_w[day] for day in valid_days if day in daily_peak_w}
+    daily_excess_kwh = {day: daily_excess_kwh[day] for day in valid_days if day in daily_excess_kwh}
+    enough = len(valid_days) >= 3
     peak_median = statistics.median(daily_peak_w.values()) if enough else None
     excess_median = statistics.median(daily_excess_kwh.values()) if enough else None
     vals = {k: ((v or {}).get('value')) for k,v in (snap or snapshot()).get('values',{}).items()}
@@ -154,7 +161,8 @@ def build_battery_plan(c, rows, snap=None):
     else: advice.append(f'PV-Prognose aus Home Assistant: etwa {pv_kwh:.1f} kWh (Einheit anhand Sensorattributen interpretiert).')
     if load is not None: advice.append(f'Aktueller Hausverbrauch: {load:.0f} W; dies ist kein Tagesverbrauchs-Forecast.')
     advice.append('Nur Empfehlung: Diese Planung sendet keine Befehle an Wechselrichter oder Verbraucher.')
-    return {'mode':'advisory_only','commands_sent':False,'history_days_available':len(daily),
+    return {'mode':'advisory_only','commands_sent':False,'history_days_available':len(valid_days),
+        'days_rejected_for_sparse_data':len(set(samples_by_day)-valid_days),'minimum_samples_per_day':min_points_per_day,
         'target_grid_import_w':target_w,'grid_import_sign':sign,'battery_capacity_kwh':capacity_kwh,
         'max_discharge_power_kw':max_discharge_kw,'battery_soc_percent':soc,
         'current_energy_kwh':current_kwh,'base_reserve_kwh':reserve_kwh,
@@ -205,10 +213,12 @@ def config_page():
    c['settings']['morning_start_hour']=max(0,min(23,int(request.form.get('morning_start_hour','5'))))
    c['settings']['morning_end_hour']=max(1,min(24,int(request.form.get('morning_end_hour','9'))))
    c['settings']['grid_import_sign']=request.form.get('grid_import_sign','unverified') if request.form.get('grid_import_sign','unverified') in ('positive','negative','unverified') else 'unverified'
+   c['settings']['battery_power_sign']=request.form.get('battery_power_sign','negative') if request.form.get('battery_power_sign','negative') in ('positive','negative') else 'negative'
    c['settings']['import_price_eur_kwh']=max(0,min(5,float(request.form.get('import_price_eur_kwh','0.30'))))
    c['settings']['export_price_eur_kwh']=max(0,min(5,float(request.form.get('export_price_eur_kwh','0.04'))))
    c['settings']['peak_alert_w']=max(500,int(request.form.get('peak_alert_w','5000')))
    c['settings']['balance_alert_pct']=max(1,min(100,float(request.form.get('balance_alert_pct','15'))))
+   c['settings']['pv_forecast_mode']=request.form.get('pv_forecast_mode','daily_total') if request.form.get('pv_forecast_mode','daily_total') in ('daily_total','remaining') else 'daily_total'
   except ValueError:flash('Grenzwerte müssen Zahlen sein.','error');return render_template('config.html',cfg=c,states=entities,ha_error=err)
   save(c);flash('Konfiguration gespeichert. Es wurden keine Geräte geschaltet.','success');entities,err=states();return render_template('config.html',cfg=c,states=entities,ha_error=err)
  return render_template('config.html',cfg=c,states=entities,ha_error=err)
@@ -460,6 +470,8 @@ def energy_report_page():
         points.sort(key=lambda x:x[0]); keys=['pv_power','load_power']
         totals={k:0.0 for k in ['pv_kwh','load_kwh','grid_import_kwh','grid_export_kwh','battery_charge_kwh','battery_discharge_kwh']}
         coverage={k:0.0 for k in ['pv_power','load_power','grid_power','battery_power']}; accepted=0; rejected=0
+        battery_sign = c.get('settings', {}).get('battery_power_sign', 'negative')
+        grid_sign = c.get('settings', {}).get('grid_import_sign', 'negative')
         for (t0,a),(t1,b) in zip(points,points[1:]):
             dt=t1-t0
             if dt<=0 or dt>120: rejected+=1; continue
@@ -473,12 +485,15 @@ def energy_report_page():
                     elif k=='load_power': totals['load_kwh']+=max(0.0,energy)
                     elif k=='grid_power':
                         # Split each interval before summing; import and export must not cancel.
-                        totals['grid_import_kwh'] += max(0.0,-float(x))*dt/3600000.0/2 + max(0.0,-float(y))*dt/3600000.0/2
-                        totals['grid_export_kwh'] += max(0.0,float(x))*dt/3600000.0/2 + max(0.0,float(y))*dt/3600000.0/2
+                        if grid_sign in ('negative', 'positive'):
+                            ix, iy = ((-float(x), -float(y)) if grid_sign == 'negative' else (float(x), float(y)))
+                            totals['grid_import_kwh'] += max(0.0,ix)*dt/3600000.0/2 + max(0.0,iy)*dt/3600000.0/2
+                            totals['grid_export_kwh'] += max(0.0,-ix)*dt/3600000.0/2 + max(0.0,-iy)*dt/3600000.0/2
                     elif k=='battery_power':
-                        # Sofar battery sensor currently appears negative during discharge.
-                        totals['battery_discharge_kwh'] += max(0.0,-float(x))*dt/3600000.0/2 + max(0.0,-float(y))*dt/3600000.0/2
-                        totals['battery_charge_kwh'] += max(0.0,float(x))*dt/3600000.0/2 + max(0.0,float(y))*dt/3600000.0/2
+                        # Normalize to positive = discharge, negative = charge.
+                        bx, by = ((-float(x), -float(y)) if battery_sign == 'negative' else (float(x), float(y)))
+                        totals['battery_discharge_kwh'] += max(0.0,bx)*dt/3600000.0/2 + max(0.0,by)*dt/3600000.0/2
+                        totals['battery_charge_kwh'] += max(0.0,-bx)*dt/3600000.0/2 + max(0.0,-by)*dt/3600000.0/2
         supply=totals['pv_kwh']+totals['grid_import_kwh']+totals['battery_discharge_kwh']
         demand=totals['load_kwh']+totals['grid_export_kwh']+totals['battery_charge_kwh']
         residual=supply-demand
@@ -497,8 +512,24 @@ def energy_report_page():
     forecast_kwh=None
     if isinstance(fv,(int,float)):
         forecast_kwh=float(fv)/1000 if 'wh' in fu and 'kwh' not in fu else float(fv)
+    # Interpret the configured forecast semantics explicitly; do not silently subtract actual PV
+    # from a forecast that already represents the remaining-day production.
+    forecast_mode=c.get('settings',{}).get('pv_forecast_mode','daily_total')
+    if forecast_kwh is not None and forecast_kwh < 0: forecast_kwh=None
+    if forecast_kwh is not None and forecast_mode == 'daily_total':
+        pv_remaining_kwh=max(0.0,forecast_kwh-today_data['pv'])
+        pv_projected_total_kwh=max(forecast_kwh,today_data['pv'])
+        forecast_label='Tagesgesamtprognose'
+    elif forecast_kwh is not None:
+        pv_remaining_kwh=forecast_kwh
+        pv_projected_total_kwh=today_data['pv']+forecast_kwh
+        forecast_label='Resttagesprognose'
+    else:
+        pv_remaining_kwh=None; pv_projected_total_kwh=None; forecast_label='Nicht verfügbar'
     return render_template('energy_report.html',cfg=c,day=today,energy=today_data,history_days=history_days,
-      forecast_kwh=forecast_kwh,forecast_age=forecast.get('updated'),active_control_enabled=False)
+      forecast_kwh=forecast_kwh,forecast_age=forecast.get('updated'),forecast_mode=forecast_mode,
+      pv_remaining_kwh=pv_remaining_kwh,pv_projected_total_kwh=pv_projected_total_kwh,
+      forecast_label=forecast_label,active_control_enabled=False)
 
 @app.route('/api/energy-report')
 def api_energy_report():
@@ -533,7 +564,10 @@ def analysis_page():
             if datetime.fromtimestamp(ts).astimezone().date().isoformat()==today: today_rows.append((ts,r.get('values',{})))
         except Exception: pass
     today_rows.sort(key=lambda x:x[0]); st=c.get('settings',{})
-    peaks=[]; high_seconds=0; pv_kwh=load_kwh=imp_kwh=exp_kwh=charge_kwh=discharge_kwh=0.0; soc_first=soc_last=None; accepted=0; rejected=0
+    peaks=[]; high_seconds=0; pv_kwh=load_kwh=imp_kwh=exp_kwh=charge_kwh=discharge_kwh=0.0; soc_first=soc_last=None; accepted=0; rejected=0; alerts=[]
+    grid_sign=st.get('grid_import_sign','unverified'); battery_sign=st.get('battery_power_sign','negative')
+    grid_import_multiplier = -1.0 if grid_sign == 'negative' else (1.0 if grid_sign == 'positive' else None)
+    battery_discharge_multiplier = -1.0 if battery_sign == 'negative' else 1.0
     for (t0,a),(t1,b) in zip(today_rows,today_rows[1:]):
         dt=t1-t0
         if dt<=0 or dt>120: rejected+=1; continue
@@ -544,20 +578,26 @@ def analysis_page():
                 e=max(0,(float(x)+float(y))*0.5)*dt/3600000
                 if k=='pv_power': pv_kwh+=e
                 else: load_kwh+=e
-        for k,sign in [('grid_power',-1),('battery_power',-1)]:
+        for k in ('grid_power','battery_power'):
             x,y=a.get(k),b.get(k)
             if isinstance(x,(int,float)) and isinstance(y,(int,float)):
-                if k=='grid_power': imp_kwh+=(max(0,sign*float(x))+max(0,sign*float(y)))*0.5*dt/3600000; exp_kwh+=(max(0,-sign*float(x))+max(0,-sign*float(y)))*0.5*dt/3600000
-                else: discharge_kwh+=(max(0,sign*float(x))+max(0,sign*float(y)))*0.5*dt/3600000; charge_kwh+=(max(0,-sign*float(x))+max(0,-sign*float(y)))*0.5*dt/3600000
+                if k=='grid_power':
+                    if grid_import_multiplier is not None:
+                        imp_kwh+=(max(0,grid_import_multiplier*float(x))+max(0,grid_import_multiplier*float(y)))*0.5*dt/3600000
+                        exp_kwh+=(max(0,-grid_import_multiplier*float(x))+max(0,-grid_import_multiplier*float(y)))*0.5*dt/3600000
+                else:
+                    discharge_kwh+=(max(0,battery_discharge_multiplier*float(x))+max(0,battery_discharge_multiplier*float(y)))*0.5*dt/3600000
+                    charge_kwh+=(max(0,-battery_discharge_multiplier*float(x))+max(0,-battery_discharge_multiplier*float(y)))*0.5*dt/3600000
         for v in (a.get('grid_power'),b.get('grid_power')):
-            if isinstance(v,(int,float)) and -float(v)>float(st.get('peak_alert_w',5000)): peaks.append({'w':round(-float(v)),'time':datetime.fromtimestamp(t0).astimezone().strftime('%H:%M')})
+            if grid_import_multiplier is not None and isinstance(v,(int,float)) and grid_import_multiplier*float(v)>float(st.get('peak_alert_w',5000)): peaks.append({'w':round(grid_import_multiplier*float(v)),'time':datetime.fromtimestamp(t0).astimezone().strftime('%H:%M')})
         if isinstance(a.get('battery_soc'),(int,float)) and soc_first is None: soc_first=float(a['battery_soc'])
         if isinstance(b.get('battery_soc'),(int,float)): soc_last=float(b['battery_soc'])
     peak=max(peaks,key=lambda x:x['w']) if peaks else None
+    if grid_import_multiplier is None:
+        alerts.append('Netzvorzeichen ist noch nicht bestätigt; Netzbezug, Einspeisung und Spitzen werden nicht zuverlässig bewertet.')
     fv=(snap.get('values',{}).get('pv_forecast') or {}).get('value'); unit=((snap.get('values',{}).get('pv_forecast') or {}).get('unit') or c.get('sensors',{}).get('pv_forecast',{}).get('unit','Wh')).lower()
     forecast_kwh=(float(fv)/1000 if 'wh' in unit and 'kwh' not in unit else float(fv)) if isinstance(fv,(int,float)) else None
     # Alerts are advisory only; do not infer a fault from an unchanged value alone.
-    alerts=[]
     if rejected: alerts.append(f'{rejected} Messintervalle über 120 s ausgelassen; Tagesenergie kann unterschätzt sein.')
     residual=pv_kwh+imp_kwh+discharge_kwh-load_kwh-exp_kwh-charge_kwh
     residual_pct=abs(residual)/max(pv_kwh+imp_kwh+discharge_kwh,load_kwh+exp_kwh+charge_kwh,0.01)*100
@@ -572,12 +612,12 @@ def analysis_page():
     target=max(0.0,float(st.get('peak_alert_w',5000)))
     for ts, values in today_rows:
         raw=values.get('grid_power')
-        over=isinstance(raw,(int,float)) and -float(raw)>target
+        over=grid_import_multiplier is not None and isinstance(raw,(int,float)) and grid_import_multiplier*float(raw)>target
         if over:
             if event_start is None or event_last is None or ts-event_last>max(60,int(os.getenv('SAMPLE_INTERVAL_SECONDS','15'))*4):
                 if event_start is not None: peak_events.append({'start':event_start,'end':event_last,'max_w':round(event_max),'duration_min':round(max(0,event_last-event_start)/60,1)})
-                event_start=ts; event_max=-float(raw)
-            else: event_max=max(event_max,-float(raw))
+                event_start=ts; event_max=grid_import_multiplier*float(raw)
+            else: event_max=max(event_max,grid_import_multiplier*float(raw))
             event_last=ts
         elif event_start is not None:
             peak_events.append({'start':event_start,'end':event_last,'max_w':round(event_max),'duration_min':round(max(0,event_last-event_start)/60,1)})
@@ -607,11 +647,11 @@ def analysis_page():
             for key in ('pv','load'):
                 k='pv_power' if key=='pv' else 'load_power'; x,y=a.get(k),b.get(k)
                 if isinstance(x,(int,float)) and isinstance(y,(int,float)): totals[key]+=max(0,(float(x)+float(y))/2)*dt/3600000
-            for k,out_key,in_key,neg_is_out in [('grid_power','import','export',True),('battery_power','discharge','charge',True)]:
+            for k,out_key,in_key,multiplier in [('grid_power','import','export',grid_import_multiplier),('battery_power','discharge','charge',battery_discharge_multiplier)]:
                 x,y=a.get(k),b.get(k)
-                if isinstance(x,(int,float)) and isinstance(y,(int,float)):
-                    out=lambda z:max(0,-float(z)) if neg_is_out else max(0,float(z))
-                    inn=lambda z:max(0,float(z)) if neg_is_out else max(0,-float(z))
+                if multiplier is not None and isinstance(x,(int,float)) and isinstance(y,(int,float)):
+                    out=lambda z:max(0,multiplier*float(z))
+                    inn=lambda z:max(0,-multiplier*float(z))
                     totals[out_key]+=(out(x)+out(y))*dt/7200000; totals[in_key]+=(inn(x)+inn(y))*dt/7200000
         history_days.append({'day':day_key,**{k:round(v,2) for k,v in totals.items()}})
     if soc_energy_gap is not None and abs(soc_energy_gap)>max(5.0,capacity*0.15): alerts.append('SoC-Änderung und integrierte Batterieleistung weichen deutlich ab; AC/DC-Messpunkt und SoC-Sensor prüfen.')
