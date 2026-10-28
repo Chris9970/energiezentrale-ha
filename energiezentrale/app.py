@@ -418,9 +418,13 @@ def learning():
         stats[k]={'count':len(vals),'average':round(statistics.mean(vals),1) if vals else None,'min':round(min(vals),1) if vals else None,'max':round(max(vals),1) if vals else None}
     c=config(); st=c.get('settings',{}); sign=st.get('grid_import_sign','unverified')
     morning=[]
+    morning_days_with_samples=set()
     for ts,r in recent:
         dt=datetime.fromtimestamp(ts).astimezone()
         if int(st.get('morning_start_hour',5)) <= dt.hour < int(st.get('morning_end_hour',9)):
+            raw_grid = r.get('values',{}).get('grid_power')
+            if isinstance(raw_grid,(int,float)):
+                morning_days_with_samples.add(dt.date().isoformat())
             v=r.get('values',{}).get('grid_power')
             if isinstance(v,(int,float)):
                 import_w=float(v) if sign=='positive' else (-float(v) if sign=='negative' else None)
@@ -432,6 +436,8 @@ def learning():
     load_patterns=learn_load_patterns(rows, days)
     return render_template('learning.html',cfg=c,stats=stats,count=len(recent),history_file=str(HIST),days=days, learning_started_at=datetime.fromtimestamp(learning_start_timestamp(),timezone.utc).astimezone().strftime('%d.%m.%Y %H:%M'),
         morning_count=len(daily),morning_peak=learned_peak,grid_import_sign=sign,daily_peaks=daily,
+        morning_days_with_samples=len(morning_days_with_samples),
+        morning_sample_count=len(morning), learning_started_timestamp=learning_start_timestamp(),
         battery_plan=battery_plan,load_patterns=load_patterns)
 
 @app.route('/api/plan')
