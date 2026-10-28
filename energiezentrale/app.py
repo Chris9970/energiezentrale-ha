@@ -444,41 +444,57 @@ def energy_report_page():
     if HIST.exists():
         try: rows=[json.loads(x) for x in HIST.read_text().splitlines()[-100000:] if x.strip()]
         except Exception: rows=[]
-    now=datetime.now().astimezone(); day=now.date().isoformat(); samples=[]
+    now=datetime.now().astimezone(); today=now.date().isoformat()
+    by_day={}
     for r in rows:
         try:
             ts=datetime.fromisoformat(r.get('timestamp','').replace('Z','+00:00')).timestamp()
-            if datetime.fromtimestamp(ts).astimezone().date().isoformat()==day:
-                vals=r.get('values',{})
-                samples.append((ts, vals))
+            day=datetime.fromtimestamp(ts).astimezone().date().isoformat()
+            by_day.setdefault(day,[]).append((ts,r.get('values',{})))
         except Exception: pass
-    samples.sort(key=lambda x:x[0])
-    # Trapezoidal integration, rejecting large gaps instead of inventing energy.
-    keys=['pv_power','load_power','grid_power','battery_power']
-    totals={k:0.0 for k in keys}; coverage={k:0.0 for k in keys}; accepted=0; rejected=0
-    max_gap=120.0
-    for (t0,a),(t1,b) in zip(samples,samples[1:]):
-        dt=t1-t0
-        if dt<=0 or dt>max_gap:
-            rejected+=1; continue
-        accepted+=1
-        for k in keys:
-            x=a.get(k); y=b.get(k)
-            if isinstance(x,(int,float)) and isinstance(y,(int,float)):
-                totals[k]+=((float(x)+float(y))/2.0)*dt/3600000.0
-                coverage[k]+=dt
-    # The user-confirmed PCC convention is negative=import, positive=export.
-    grid_import=max(0.0,-totals['grid_power']); grid_export=max(0.0,totals['grid_power'])
-    pv=totals['pv_power']; load=totals['load_power']
+    def integrate_day(points):
+        points.sort(key=lambda x:x[0]); keys=['pv_power','load_power']
+        totals={k:0.0 for k in ['pv_kwh','load_kwh','grid_import_kwh','grid_export_kwh','battery_charge_kwh','battery_discharge_kwh']}
+        coverage={k:0.0 for k in ['pv_power','load_power','grid_power','battery_power']}; accepted=0; rejected=0
+        for (t0,a),(t1,b) in zip(points,points[1:]):
+            dt=t1-t0
+            if dt<=0 or dt>120: rejected+=1; continue
+            accepted+=1
+            for k in coverage:
+                x=a.get(k); y=b.get(k)
+                if isinstance(x,(int,float)) and isinstance(y,(int,float)):
+                    energy=((float(x)+float(y))/2.0)*dt/3600000.0
+                    coverage[k]+=dt
+                    if k=='pv_power': totals['pv_kwh']+=max(0.0,energy)
+                    elif k=='load_power': totals['load_kwh']+=max(0.0,energy)
+                    elif k=='grid_power':
+                        # Split each interval before summing; import and export must not cancel.
+                        totals['grid_import_kwh'] += max(0.0,-float(x))*dt/3600000.0/2 + max(0.0,-float(y))*dt/3600000.0/2
+                        totals['grid_export_kwh'] += max(0.0,float(x))*dt/3600000.0/2 + max(0.0,float(y))*dt/3600000.0/2
+                    elif k=='battery_power':
+                        # Sofar battery sensor currently appears negative during discharge.
+                        totals['battery_discharge_kwh'] += max(0.0,-float(x))*dt/3600000.0/2 + max(0.0,-float(y))*dt/3600000.0/2
+                        totals['battery_charge_kwh'] += max(0.0,float(x))*dt/3600000.0/2 + max(0.0,float(y))*dt/3600000.0/2
+        supply=totals['pv_kwh']+totals['grid_import_kwh']+totals['battery_discharge_kwh']
+        demand=totals['load_kwh']+totals['grid_export_kwh']+totals['battery_charge_kwh']
+        residual=supply-demand
+        totals.update({'balance_supply_kwh':supply,'balance_demand_kwh':demand,'balance_residual_kwh':residual,
+                       'balance_residual_pct':abs(residual)/max(supply,demand,0.01)*100,
+                       'accepted':accepted,'rejected':rejected,'samples':len(points),
+                       'coverage':{k:round(v/3600,2) for k,v in coverage.items()}})
+        return totals
+    daily={day:integrate_day(points) for day,points in by_day.items()}
+    today_data=daily.get(today,integrate_day([]))
+    history_days=[]
+    for day in sorted(daily,reverse=True)[:7]:
+        history_days.append({'day':day,**daily[day]})
     forecast=(snap.get('values',{}).get('pv_forecast') or {})
     fv=forecast.get('value'); fu=(forecast.get('unit') or c.get('sensors',{}).get('pv_forecast',{}).get('unit','')).lower()
     forecast_kwh=None
     if isinstance(fv,(int,float)):
         forecast_kwh=float(fv)/1000 if 'wh' in fu and 'kwh' not in fu else float(fv)
-    return render_template('energy_report.html',cfg=c,day=day,sample_count=len(samples),accepted=accepted,rejected=rejected,
-      pv_kwh=pv,load_kwh=load,grid_import_kwh=grid_import,grid_export_kwh=grid_export,battery_signed_kwh=totals['battery_power'],
-      coverage={k:round(v/3600,2) for k,v in coverage.items()},forecast_kwh=forecast_kwh,forecast_age=forecast.get('updated'),
-      active_control_enabled=False)
+    return render_template('energy_report.html',cfg=c,day=today,energy=today_data,history_days=history_days,
+      forecast_kwh=forecast_kwh,forecast_age=forecast.get('updated'),active_control_enabled=False)
 
 @app.route('/api/energy-report')
 def api_energy_report():
