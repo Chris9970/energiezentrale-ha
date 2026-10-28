@@ -38,3 +38,8 @@
 - Neue read-only API `/api/energy-report` mit Durchschnittsleistungen der letzten 24 Stunden (keine kWh-Integration).
 - Bestehende Morgenreserve bleibt beratend und benötigt mindestens drei Morgen mit gültigen Daten.
 - Aktive Steuerung ist fest deaktiviert; es werden keine Befehle an Wechselrichter oder Verbraucher gesendet.
+
+
+## Version 0.6.1
+
+Diagnose kennzeichnet Batterieleistung und SoC an der konfigurierten SoC-Untergrenze bei nahezu 0 W Batterieleistung als plausiblen Stillstand, statt allein wegen des Alters pauschal 'Veraltet' zu melden. Das ist eine Plausibilitätsregel und kein eigenständiger Kommunikationsnachweis. Aktive Steuerung bleibt deaktiviert.

@@ -430,6 +430,14 @@ def diagnostics():
         except Exception: pass
         value=v.get('value'); status='OK' if value is not None else 'Fehlt / nicht numerisch'
         if age is not None and age>300: status='Veraltet'
+        # A stationary battery at its configured minimum SoC is a plausible
+        # operating state, not by itself evidence of a stale sensor.
+        soc_value=vals.get('battery_soc'); batt_value=vals.get('battery_power')
+        reserve=float(c.get('settings',{}).get('battery_reserve_percent',20) or 20)
+        at_reserve=isinstance(soc_value,(int,float)) and soc_value <= reserve + 1.0
+        battery_idle=isinstance(batt_value,(int,float)) and abs(batt_value) <= 100
+        if key in ('battery_soc','battery_power') and at_reserve and battery_idle and value is not None:
+            status='Entladegrenze erreicht – plausibel'
         sensors.append({'label':meta.get('label',key),'entity_id':meta.get('entity_id',''),'value':value,'unit':v.get('unit',''),'age':age,'status':status})
     # Compare PV and load without claiming a full physical balance.
     pv=vals.get('pv_power'); load=vals.get('load_power'); grid=vals.get('grid_power'); bat=vals.get('battery_power')
