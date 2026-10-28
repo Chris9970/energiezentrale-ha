@@ -430,20 +430,55 @@ def diagnostics():
         except Exception: pass
         value=v.get('value'); status='OK' if value is not None else 'Fehlt / nicht numerisch'
         if age is not None and age>300: status='Veraltet'
-        # A stationary battery at its configured minimum SoC is a plausible
-        # operating state, not by itself evidence of a stale sensor.
-        soc_value=vals.get('battery_soc'); batt_value=vals.get('battery_power')
-        reserve=float(c.get('settings',{}).get('battery_reserve_percent',20) or 20)
-        at_reserve=isinstance(soc_value,(int,float)) and soc_value <= reserve + 1.0
-        battery_idle=isinstance(batt_value,(int,float)) and abs(batt_value) <= 100
-        if key in ('battery_soc','battery_power') and at_reserve and battery_idle and value is not None:
-            status='Entladegrenze erreicht – plausibel'
         sensors.append({'label':meta.get('label',key),'entity_id':meta.get('entity_id',''),'value':value,'unit':v.get('unit',''),'age':age,'status':status})
     # Compare PV and load without claiming a full physical balance.
     pv=vals.get('pv_power'); load=vals.get('load_power'); grid=vals.get('grid_power'); bat=vals.get('battery_power')
     balance=(pv-load) if isinstance(pv,(int,float)) and isinstance(load,(int,float)) else None
     battery=build_battery_plan(c,rows,snap)
     return render_template('diagnostics.html',cfg=c,sensors=sensors,history_count=len(rows),recent_count=len(recent),days=len(days),gaps=gaps,balance=balance,vals=vals,battery=battery)
+
+
+@app.route('/energy-report')
+def energy_report_page():
+    c=config(); snap=snapshot(); rows=[]
+    if HIST.exists():
+        try: rows=[json.loads(x) for x in HIST.read_text().splitlines()[-100000:] if x.strip()]
+        except Exception: rows=[]
+    now=datetime.now().astimezone(); day=now.date().isoformat(); samples=[]
+    for r in rows:
+        try:
+            ts=datetime.fromisoformat(r.get('timestamp','').replace('Z','+00:00')).timestamp()
+            if datetime.fromtimestamp(ts).astimezone().date().isoformat()==day:
+                vals=r.get('values',{})
+                samples.append((ts, vals))
+        except Exception: pass
+    samples.sort(key=lambda x:x[0])
+    # Trapezoidal integration, rejecting large gaps instead of inventing energy.
+    keys=['pv_power','load_power','grid_power','battery_power']
+    totals={k:0.0 for k in keys}; coverage={k:0.0 for k in keys}; accepted=0; rejected=0
+    max_gap=120.0
+    for (t0,a),(t1,b) in zip(samples,samples[1:]):
+        dt=t1-t0
+        if dt<=0 or dt>max_gap:
+            rejected+=1; continue
+        accepted+=1
+        for k in keys:
+            x=a.get(k); y=b.get(k)
+            if isinstance(x,(int,float)) and isinstance(y,(int,float)):
+                totals[k]+=((float(x)+float(y))/2.0)*dt/3600000.0
+                coverage[k]+=dt
+    # The user-confirmed PCC convention is negative=import, positive=export.
+    grid_import=max(0.0,-totals['grid_power']); grid_export=max(0.0,totals['grid_power'])
+    pv=totals['pv_power']; load=totals['load_power']
+    forecast=(snap.get('values',{}).get('pv_forecast') or {})
+    fv=forecast.get('value'); fu=(forecast.get('unit') or c.get('sensors',{}).get('pv_forecast',{}).get('unit','')).lower()
+    forecast_kwh=None
+    if isinstance(fv,(int,float)):
+        forecast_kwh=float(fv)/1000 if 'wh' in fu and 'kwh' not in fu else float(fv)
+    return render_template('energy_report.html',cfg=c,day=day,sample_count=len(samples),accepted=accepted,rejected=rejected,
+      pv_kwh=pv,load_kwh=load,grid_import_kwh=grid_import,grid_export_kwh=grid_export,battery_signed_kwh=totals['battery_power'],
+      coverage={k:round(v/3600,2) for k,v in coverage.items()},forecast_kwh=forecast_kwh,forecast_age=forecast.get('updated'),
+      active_control_enabled=False)
 
 @app.route('/api/energy-report')
 def api_energy_report():
