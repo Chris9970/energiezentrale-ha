@@ -1,40 +1,19 @@
-# Energiezentrale 0.5.0
+# Energiezentrale 1.0.0
 
-## In 0.5.0 umgesetzt
-- Neue beratende PV-Überschussplanung auf der Seite „Verbraucher“.
-- Schätzt Einspeisung anhand des konfigurierten Netzleistungs-Vorzeichens.
-- Berücksichtigt einen Sicherheitsabstand von 1000 W.
-- Ordnet aktivierte Verbraucher nach Priorität und schlägt passende Heizstufen/Nennleistungen vor.
-- Keine Schaltbefehle an Verbraucher oder Wechselrichter; aktive Regelung bleibt deaktiviert.
+Read-only Home Assistant energy analysis add-on. Keeps prior overview, simulation, configuration, consumer planning, learning/history, diagnostics and daily energy pages.
 
-## Weiterhin enthalten
-- Home-Assistant-Sensorübersicht und lokale Messwerthistorie.
-- Statistiken und beratende Batterie-Morgenreserve aus historischen Daten.
-- Konfigurierbares weiches Netzbezugsziel, Batteriekapazität und Reserve.
+## New in 1.0.0
+- SoC-derived stored-energy change compared with integrated battery energy as a rough diagnostic.
+- Grid peaks grouped into approximate events instead of only counting repeated over-limit samples.
+- Seven-day energy rollup table for PV, load, grid import/export and battery charge/discharge.
 
-## Hinweise
-- Das Add-on muss über Home Assistant Supervisor gestartet werden, damit die Home-Assistant-API verfügbar ist.
-- Die Netzleistungs-Vorzeichenkonfiguration muss anhand realer Messwerte stimmen. Für die beschriebene Anlage gilt: Netzbezug negativ, Einspeisung positiv.
-- Die Verbraucherplanung ist nur eine rechnerische Vorauswahl. Vor einer späteren Automatisierung sind Anlaufströme, Mindestlaufzeiten, Druck-/Temperaturgrenzen, gegenseitige Verriegelungen und sichere Ausgänge gesondert zu implementieren und zu testen.
-- Python-Syntax wurde geprüft. Ein vollständiger Laufzeittest war in der Erstellungsumgebung nicht möglich, da Flask dort nicht installiert ist.
+## Retained from 0.9.0
+- Combined Anlagenanalyse page: daily PV/load/grid/battery integration, battery SoC snapshot comparison, grid peak sample detection, energy balance residual, tariff-based estimated import costs/export revenue, forecast value display, data-gap counts, warnings and advisory consumer list.
+- Configurable import price, export tariff, grid peak warning threshold and balance warning threshold.
+- All calculations are advisory. The PV forecast is deliberately not treated as remaining-day surplus until the configured sensor's meaning is known.
 
+## Safety
+Active control is forced off and the application does not send inverter or consumer commands. Energy estimates depend on sensor mapping, units, sign conventions and history coverage. Large data gaps are skipped; peak counts are samples above threshold, not deduplicated events. The battery power convention used is negative=discharge and positive=charge, based on the observed Sofar history.
 
-## Version 0.5.0
-- Ergänzte konfigurierbare Zeitfenster für die Flüssigfütterung als reine Lastprognose (Standard: 06:45, 12:00, 18:15; Laufzeit 8 Minuten; Leistung 0 = unbekannt).
-- Einstellbarer PV-Überschuss-Sicherheitsabstand.
-- Neue historische Spitzenanalyse unter `/api/peak-analysis`; Dauer oberhalb des Ziels wird nur bei lückenarmen benachbarten Messpunkten geschätzt.
-- Keine aktiven Wechselrichter- oder Verbraucherbefehle; Steuerung bleibt deaktiviert.
-
-
-## Version 0.5.1
-- Ergänzt eine Simulationsseite mit aktuellen Messwerten, einfacher PV-minus-Last-Näherung und vorläufiger Batterieplanung.
-- Fehlende Messwerte werden als fehlend angezeigt.
-- Simulation ist rein beratend; es werden keine Steuerbefehle gesendet.
-- Vollständiger Laufzeit-/Browser-Test muss in Home Assistant erfolgen.
-
-
-## Version 0.6.0 – Analyse-Erweiterung
-- Neue Seite „Diagnose & Bilanz“ mit Sensorstatus, Alter der Messwerte, Historienumfang und grober PV-minus-Last-Näherung.
-- Neue read-only API `/api/energy-report` mit Durchschnittsleistungen der letzten 24 Stunden (keine kWh-Integration).
-- Bestehende Morgenreserve bleibt beratend und benötigt mindestens drei Morgen mit gültigen Daten.
-- Aktive Steuerung ist fest deaktiviert; es werden keine Befehle an Wechselrichter oder Verbraucher gesendet.
+## Validation
+Python syntax/AST and ZIP integrity checked. Python syntax compilation, Jinja template parsing, and ZIP integrity were tested. Full Home Assistant runtime test was not possible in the build environment because Flask is not installed there.

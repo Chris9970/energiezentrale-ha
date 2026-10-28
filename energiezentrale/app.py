@@ -14,7 +14,7 @@ DEFAULT={'plant_name':'Meine Energiezentrale','sensors':{
 'inverter_output':{'label':'Wechselrichter-Ausgangsleistung','entity_id':'sensor.sofar_speicher_active_power_output_total','unit':'W'},
 'pv_forecast':{'label':'PV-Prognose','entity_id':'sensor.solcast_pv_forecast_prognose_heute','unit':'Wh'}},
 'consumers':[{'id':'heater','name':'Elektroheizung','type':'heater','enabled':True,'nominal_power_w':30000,'stages_w':[7500,15000,22500,30000],'priority':1},{'id':'compressor','name':'Kompressor','type':'motor','enabled':True,'nominal_power_w':11000,'stages_w':[],'priority':2}],
-'control_entities':{'mode':'select.sofar_speicher_inverter_energy_storage_mode','grid_setpoint':'number.sofar_speicher_inverter_passive_desired_grid_power','charge_power':'number.sofar_speicher_inverter_passive_maximum_battery_power','discharge_power':'number.sofar_speicher_inverter_passive_minimum_battery_power','apply_button':'button.sofar_speicher_inverter_passive_update_battery_charge_discharge'},'settings':{'grid_import_limit_w':5000,'battery_reserve_percent':25,'inverter_count':2,'control_enabled':False,'mode':'observe','grid_setpoint_sign':'unverified','grid_import_sign':'unverified','morning_start_hour':5,'morning_end_hour':9,'learning_days':14,'battery_capacity_kwh':80,'battery_discharge_power_kw':30,'silage_slots':['06:30','12:00','18:00'],'silage_flex_minutes':45,'silage_duration_minutes':15,'feeding_slots':['06:45','12:00','18:15'],'feeding_flex_minutes':10,'feeding_duration_minutes':8,'feeding_power_w':0,'consumer_surplus_margin_w':1000}}
+'control_entities':{'mode':'select.sofar_speicher_inverter_energy_storage_mode','grid_setpoint':'number.sofar_speicher_inverter_passive_desired_grid_power','charge_power':'number.sofar_speicher_inverter_passive_maximum_battery_power','discharge_power':'number.sofar_speicher_inverter_passive_minimum_battery_power','apply_button':'button.sofar_speicher_inverter_passive_update_battery_charge_discharge'},'settings':{'grid_import_limit_w':5000,'battery_reserve_percent':25,'inverter_count':2,'control_enabled':False,'mode':'observe','grid_setpoint_sign':'unverified','grid_import_sign':'unverified','morning_start_hour':5,'morning_end_hour':9,'learning_days':14,'battery_capacity_kwh':80,'battery_discharge_power_kw':30,'silage_slots':['06:30','12:00','18:00'],'silage_flex_minutes':45,'silage_duration_minutes':15,'feeding_slots':['06:45','12:00','18:15'],'feeding_flex_minutes':10,'feeding_duration_minutes':8,'feeding_power_w':0,'consumer_surplus_margin_w':1000,'import_price_eur_kwh':0.30,'export_price_eur_kwh':0.04,'peak_alert_w':5000,'balance_alert_pct':15}}
 def config():
  if not CFG.exists(): CFG.write_text(json.dumps(DEFAULT,ensure_ascii=False,indent=2))
  try:
@@ -205,6 +205,10 @@ def config_page():
    c['settings']['morning_start_hour']=max(0,min(23,int(request.form.get('morning_start_hour','5'))))
    c['settings']['morning_end_hour']=max(1,min(24,int(request.form.get('morning_end_hour','9'))))
    c['settings']['grid_import_sign']=request.form.get('grid_import_sign','unverified') if request.form.get('grid_import_sign','unverified') in ('positive','negative','unverified') else 'unverified'
+   c['settings']['import_price_eur_kwh']=max(0,min(5,float(request.form.get('import_price_eur_kwh','0.30'))))
+   c['settings']['export_price_eur_kwh']=max(0,min(5,float(request.form.get('export_price_eur_kwh','0.04'))))
+   c['settings']['peak_alert_w']=max(500,int(request.form.get('peak_alert_w','5000')))
+   c['settings']['balance_alert_pct']=max(1,min(100,float(request.form.get('balance_alert_pct','15'))))
   except ValueError:flash('Grenzwerte müssen Zahlen sein.','error');return render_template('config.html',cfg=c,states=entities,ha_error=err)
   save(c);flash('Konfiguration gespeichert. Es wurden keine Geräte geschaltet.','success');entities,err=states();return render_template('config.html',cfg=c,states=entities,ha_error=err)
  return render_template('config.html',cfg=c,states=entities,ha_error=err)
@@ -512,6 +516,112 @@ def api_energy_report():
         x=[r.get('values',{}).get(k) for r in data if isinstance(r.get('values',{}).get(k),(int,float))]
         return round(sum(x)/len(x),1) if x else None
     return jsonify({'period':'last_24_hours','samples':len(data),'average_power_w':{'pv':avg('pv_power'),'load':avg('load_power'),'grid_raw':avg('grid_power'),'battery':avg('battery_power')},'note':'Durchschnittsleistungen, keine kWh-Energieintegration. Grid-Vorzeichen gemäß Konfiguration: '+str(c.get('settings',{}).get('grid_import_sign','unverified')),'active_control_enabled':False,'commands_sent':False})
+
+
+
+@app.route('/analysis')
+def analysis_page():
+    """Read-only combined diagnostics: battery, peaks, costs, forecast and advisory loads."""
+    c=config(); snap=snapshot(); rows=[]
+    if HIST.exists():
+        try: rows=[json.loads(x) for x in HIST.read_text().splitlines()[-100000:] if x.strip()]
+        except Exception: rows=[]
+    now=datetime.now().astimezone(); today=now.date().isoformat(); today_rows=[]
+    for r in rows:
+        try:
+            ts=datetime.fromisoformat(r.get('timestamp','').replace('Z','+00:00')).timestamp()
+            if datetime.fromtimestamp(ts).astimezone().date().isoformat()==today: today_rows.append((ts,r.get('values',{})))
+        except Exception: pass
+    today_rows.sort(key=lambda x:x[0]); st=c.get('settings',{})
+    peaks=[]; high_seconds=0; pv_kwh=load_kwh=imp_kwh=exp_kwh=charge_kwh=discharge_kwh=0.0; soc_first=soc_last=None; accepted=0; rejected=0
+    for (t0,a),(t1,b) in zip(today_rows,today_rows[1:]):
+        dt=t1-t0
+        if dt<=0 or dt>120: rejected+=1; continue
+        accepted+=1
+        for k in ('pv_power','load_power'):
+            x,y=a.get(k),b.get(k)
+            if isinstance(x,(int,float)) and isinstance(y,(int,float)):
+                e=max(0,(float(x)+float(y))*0.5)*dt/3600000
+                if k=='pv_power': pv_kwh+=e
+                else: load_kwh+=e
+        for k,sign in [('grid_power',-1),('battery_power',-1)]:
+            x,y=a.get(k),b.get(k)
+            if isinstance(x,(int,float)) and isinstance(y,(int,float)):
+                if k=='grid_power': imp_kwh+=(max(0,sign*float(x))+max(0,sign*float(y)))*0.5*dt/3600000; exp_kwh+=(max(0,-sign*float(x))+max(0,-sign*float(y)))*0.5*dt/3600000
+                else: discharge_kwh+=(max(0,sign*float(x))+max(0,sign*float(y)))*0.5*dt/3600000; charge_kwh+=(max(0,-sign*float(x))+max(0,-sign*float(y)))*0.5*dt/3600000
+        for v in (a.get('grid_power'),b.get('grid_power')):
+            if isinstance(v,(int,float)) and -float(v)>float(st.get('peak_alert_w',5000)): peaks.append({'w':round(-float(v)),'time':datetime.fromtimestamp(t0).astimezone().strftime('%H:%M')})
+        if isinstance(a.get('battery_soc'),(int,float)) and soc_first is None: soc_first=float(a['battery_soc'])
+        if isinstance(b.get('battery_soc'),(int,float)): soc_last=float(b['battery_soc'])
+    peak=max(peaks,key=lambda x:x['w']) if peaks else None
+    fv=(snap.get('values',{}).get('pv_forecast') or {}).get('value'); unit=((snap.get('values',{}).get('pv_forecast') or {}).get('unit') or c.get('sensors',{}).get('pv_forecast',{}).get('unit','Wh')).lower()
+    forecast_kwh=(float(fv)/1000 if 'wh' in unit and 'kwh' not in unit else float(fv)) if isinstance(fv,(int,float)) else None
+    # Alerts are advisory only; do not infer a fault from an unchanged value alone.
+    alerts=[]
+    if rejected: alerts.append(f'{rejected} Messintervalle über 120 s ausgelassen; Tagesenergie kann unterschätzt sein.')
+    residual=pv_kwh+imp_kwh+discharge_kwh-load_kwh-exp_kwh-charge_kwh
+    residual_pct=abs(residual)/max(pv_kwh+imp_kwh+discharge_kwh,load_kwh+exp_kwh+charge_kwh,0.01)*100
+    if residual_pct>float(st.get('balance_alert_pct',15)): alerts.append(f'Bilanzabweichung {residual:+.2f} kWh ({residual_pct:.1f} %): Messpunkte und Sensorvorzeichen prüfen.')
+    if peak: alerts.append(f"Netzbezugsspitze über Planungsgrenze: {peak['w']} W um {peak['time']}.")
+    price=max(0,float(st.get('import_price_eur_kwh',0.30))); export_price=max(0,float(st.get('export_price_eur_kwh',0.04)))
+    costs=imp_kwh*price; revenue=exp_kwh*export_price
+    battery_soc_now=(snap.get('values',{}).get('battery_soc') or {}).get('value')
+    if battery_soc_now is None: battery_soc_now=soc_last
+    # Deduplicate adjacent over-limit samples into events; don't count each sample as a separate peak.
+    peak_events=[]; event_start=None; event_last=None; event_max=0.0
+    target=max(0.0,float(st.get('peak_alert_w',5000)))
+    for ts, values in today_rows:
+        raw=values.get('grid_power')
+        over=isinstance(raw,(int,float)) and -float(raw)>target
+        if over:
+            if event_start is None or event_last is None or ts-event_last>max(60,int(os.getenv('SAMPLE_INTERVAL_SECONDS','15'))*4):
+                if event_start is not None: peak_events.append({'start':event_start,'end':event_last,'max_w':round(event_max),'duration_min':round(max(0,event_last-event_start)/60,1)})
+                event_start=ts; event_max=-float(raw)
+            else: event_max=max(event_max,-float(raw))
+            event_last=ts
+        elif event_start is not None:
+            peak_events.append({'start':event_start,'end':event_last,'max_w':round(event_max),'duration_min':round(max(0,event_last-event_start)/60,1)})
+            event_start=event_last=None; event_max=0.0
+    if event_start is not None: peak_events.append({'start':event_start,'end':event_last,'max_w':round(event_max),'duration_min':round(max(0,event_last-event_start)/60,1)})
+    # SoC delta converted to stored-energy change; compare with integrated AC battery energy only as a rough diagnostic.
+    capacity=max(0.0,float(st.get('battery_capacity_kwh',80)))
+    soc_delta_kwh=((soc_last-soc_first)*capacity/100.0) if soc_first is not None and soc_last is not None else None
+    battery_net_kwh=charge_kwh-discharge_kwh
+    soc_energy_gap=(soc_delta_kwh-battery_net_kwh) if soc_delta_kwh is not None else None
+    if len(peak_events): alerts.append(f'{len(peak_events)} Netzspitzen-Ereignis(se) über {target:.0f} W erkannt; längstes Ereignis {max(x["duration_min"] for x in peak_events):.1f} min.')
+    # Daily rollup over the last seven recorded dates, with the same gap-safe integration.
+    grouped={}
+    for row in rows:
+        try:
+            ts=datetime.fromisoformat(row.get('timestamp','').replace('Z','+00:00')).timestamp()
+            values=row.get('values',{})
+            grouped.setdefault(datetime.fromtimestamp(ts).astimezone().date().isoformat(),[]).append((ts,values))
+        except Exception:
+            continue
+    history_days=[]
+    for day_key, pts in sorted(grouped.items(),reverse=True)[:7]:
+        pts.sort(key=lambda z:z[0]); totals={'pv':0.0,'load':0.0,'import':0.0,'export':0.0,'charge':0.0,'discharge':0.0}
+        for (t0,a),(t1,b) in zip(pts,pts[1:]):
+            dt=t1-t0
+            if dt<=0 or dt>120: continue
+            for key in ('pv','load'):
+                k='pv_power' if key=='pv' else 'load_power'; x,y=a.get(k),b.get(k)
+                if isinstance(x,(int,float)) and isinstance(y,(int,float)): totals[key]+=max(0,(float(x)+float(y))/2)*dt/3600000
+            for k,out_key,in_key,neg_is_out in [('grid_power','import','export',True),('battery_power','discharge','charge',True)]:
+                x,y=a.get(k),b.get(k)
+                if isinstance(x,(int,float)) and isinstance(y,(int,float)):
+                    out=lambda z:max(0,-float(z)) if neg_is_out else max(0,float(z))
+                    inn=lambda z:max(0,float(z)) if neg_is_out else max(0,-float(z))
+                    totals[out_key]+=(out(x)+out(y))*dt/7200000; totals[in_key]+=(inn(x)+inn(y))*dt/7200000
+        history_days.append({'day':day_key,**{k:round(v,2) for k,v in totals.items()}})
+    if soc_energy_gap is not None and abs(soc_energy_gap)>max(5.0,capacity*0.15): alerts.append('SoC-Änderung und integrierte Batterieleistung weichen deutlich ab; AC/DC-Messpunkt und SoC-Sensor prüfen.')
+    # Existing consumer plan is displayed as advisory; no entity writes exist in this route.
+    consumers=c.get('consumers',[])
+    return render_template('analysis.html',cfg=c,day=today,energy={'pv':pv_kwh,'load':load_kwh,'import':imp_kwh,'export':exp_kwh,'charge':charge_kwh,'discharge':discharge_kwh,'residual':residual,'residual_pct':residual_pct},peak=peak,peak_count=len(peaks),peak_events=peak_events,soc_start=soc_first,soc_end=soc_last,soc_now=battery_soc_now,soc_delta_kwh=soc_delta_kwh,soc_energy_gap=soc_energy_gap,history_days=history_days,forecast_kwh=forecast_kwh,forecast_age=(snap.get('values',{}).get('pv_forecast') or {}).get('updated'),costs=costs,revenue=revenue,price=price,export_price=export_price,alerts=alerts,consumers=consumers,samples=len(today_rows),accepted=accepted,rejected=rejected,active_control_enabled=False)
+
+@app.route('/api/analysis')
+def api_analysis():
+    return jsonify({'active_control_enabled':False,'commands_sent':False,'note':'Read-only diagnostics; estimates depend on sensor mapping, units and data coverage.','page':'/analysis'})
 
 @app.route('/health')
 def health():return jsonify({'status':'ok','mode':'observe','active_control_enabled':False,'timestamp':datetime.now(timezone.utc).isoformat()})
