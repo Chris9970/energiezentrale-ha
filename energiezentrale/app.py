@@ -139,6 +139,21 @@ def build_battery_plan(c, rows, snap=None):
 @app.route('/')
 def index():
  c=config(); s=snapshot(); _,err=states(); return render_template('index.html',cfg=c,snap=s,ha_error=err)
+@app.route('/simulation')
+def simulation():
+ c=config(); snap=snapshot(); vals={k:((v or {}).get('value')) for k,v in snap.get('values',{}).items()}
+ st=c.get('settings',{}); sign=st.get('grid_import_sign','unverified'); raw=vals.get('grid_power')
+ grid_import=(-raw if sign=='negative' else raw if sign=='positive' else None) if isinstance(raw,(int,float)) else None
+ pv=vals.get('pv_power'); load=vals.get('load_power'); soc=vals.get('battery_soc')
+ surplus=(pv-load) if isinstance(pv,(int,float)) and isinstance(load,(int,float)) else None
+ rows=[]
+ if HIST.exists():
+  try: rows=[json.loads(x) for x in HIST.read_text().splitlines()[-100000:] if x.strip()]
+  except Exception: rows=[]
+ battery=build_battery_plan(c,rows,snap)
+ missing=[c.get('sensors',{}).get(k,{}).get('label',k) for k in ('pv_power','load_power','grid_power','battery_soc') if not isinstance(vals.get(k),(int,float))]
+ return render_template('simulation.html',cfg=c,snap=snap,vals=vals,grid_import=grid_import,surplus=surplus,battery=battery,missing=missing,history_count=len(rows))
+
 @app.route('/api/snapshot')
 def api_snapshot():return jsonify(snapshot())
 @app.route('/config',methods=['GET','POST'])

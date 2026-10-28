@@ -24,3 +24,10 @@
 - Einstellbarer PV-Überschuss-Sicherheitsabstand.
 - Neue historische Spitzenanalyse unter `/api/peak-analysis`; Dauer oberhalb des Ziels wird nur bei lückenarmen benachbarten Messpunkten geschätzt.
 - Keine aktiven Wechselrichter- oder Verbraucherbefehle; Steuerung bleibt deaktiviert.
+
+
+## Version 0.5.1
+- Ergänzt eine Simulationsseite mit aktuellen Messwerten, einfacher PV-minus-Last-Näherung und vorläufiger Batterieplanung.
+- Fehlende Messwerte werden als fehlend angezeigt.
+- Simulation ist rein beratend; es werden keine Steuerbefehle gesendet.
+- Vollständiger Laufzeit-/Browser-Test muss in Home Assistant erfolgen.
