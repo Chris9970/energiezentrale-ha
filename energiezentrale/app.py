@@ -123,7 +123,20 @@ def build_battery_plan(c, rows, snap=None):
     # At the default 15 s sampling interval, 60 points represent only 15 minutes; this is a
     # conservative minimum-data gate, not a claim of full-window coverage.
     min_points_per_day = max(30, int(st.get('morning_min_samples_per_day', 60)))
-    valid_days = {day for day, points in samples_by_day.items() if len(points) >= min_points_per_day}
+    # A high sample count from a short burst is not a complete morning. Require
+    # both the configured minimum sample count and coverage across at least half
+    # of the configured morning window; gaps are still excluded from integration.
+    window_seconds = max(1, morning_end - morning_start) * 3600
+    min_coverage_seconds = window_seconds * 0.50
+    coverage_seconds = {}
+    for day, points in samples_by_day.items():
+        stamps = sorted(t for t, _ in points)
+        coverage_seconds[day] = (stamps[-1] - stamps[0]) if len(stamps) >= 2 else 0
+    valid_days = {
+        day for day, points in samples_by_day.items()
+        if len(points) >= min_points_per_day
+        and coverage_seconds.get(day, 0) >= min_coverage_seconds
+    }
     daily_peak_w = {day: daily_peak_w[day] for day in valid_days if day in daily_peak_w}
     daily_excess_kwh = {day: daily_excess_kwh[day] for day in valid_days if day in daily_excess_kwh}
     enough = len(valid_days) >= 3
@@ -150,7 +163,7 @@ def build_battery_plan(c, rows, snap=None):
     target_soc = min(100.0, required_kwh/capacity_kwh*100.0) if required_kwh is not None and capacity_kwh else None
     advice = []
     if not enough:
-        advice.append(f'Für belastbare Batterieplanung werden mindestens drei vollständige Morgen mit gültigen Netzleistungsdaten benötigt; aktuell: {len(daily)}.')
+        advice.append(f'Für belastbare Batterieplanung werden mindestens drei Morgen mit genügend Messpunkten und mindestens {int(min_coverage_seconds/60)} Minuten zeitlicher Abdeckung benötigt; gültig: {len(valid_days)}, verworfen: {len(set(samples_by_day)-valid_days)}.')
     else:
         advice.append(f'Median der morgendlichen Netzbezugs-Spitzen: {peak_median:.0f} W.')
         advice.append(f'Geschätzte tägliche Energie oberhalb des weichen {target_w:.0f}-W-Ziels: {excess_median:.2f} kWh.')
@@ -163,6 +176,8 @@ def build_battery_plan(c, rows, snap=None):
     advice.append('Nur Empfehlung: Diese Planung sendet keine Befehle an Wechselrichter oder Verbraucher.')
     return {'mode':'advisory_only','commands_sent':False,'history_days_available':len(valid_days),
         'days_rejected_for_sparse_data':len(set(samples_by_day)-valid_days),'minimum_samples_per_day':min_points_per_day,
+        'minimum_morning_coverage_minutes':int(min_coverage_seconds/60),
+        'morning_coverage_minutes_by_day':{day:round(seconds/60,1) for day,seconds in coverage_seconds.items()},
         'target_grid_import_w':target_w,'grid_import_sign':sign,'battery_capacity_kwh':capacity_kwh,
         'max_discharge_power_kw':max_discharge_kw,'battery_soc_percent':soc,
         'current_energy_kwh':current_kwh,'base_reserve_kwh':reserve_kwh,
