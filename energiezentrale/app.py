@@ -369,7 +369,10 @@ def consumers():
    except ValueError:x['compressor_on_bar']=6.0
    try:x['compressor_off_bar']=max(0.0,min(30.0,float(offbars[i]))) if i<len(offbars) and offbars[i].strip() else x.get('compressor_off_bar',8.0)
    except ValueError:x['compressor_off_bar']=8.0
-   x['leak_monitor_enabled']=str(x['id']) in request.form.getlist('consumer_leak_monitor')
+   
+   if x.get('type')=='motor':
+    x['leak_monitor_enabled']=str(x['id']) in request.form.getlist('consumer_leak_monitor')
+   # For other consumer types, retain any stored compressor-specific setting.
    x['compressor_state_entity']=valid_entity(states[i] if i<len(states) else x.get('compressor_state_entity',''))
    x['temperature_sensor_entity']=valid_entity(temps[i] if i<len(temps) else x.get('temperature_sensor_entity',''))
    try:x['target_temperature_c']=max(-20.0,min(100.0,float(targets[i]))) if i<len(targets) and targets[i].strip() else x.get('target_temperature_c',20.0)
