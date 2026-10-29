@@ -310,41 +310,55 @@ def config_page():
 @app.route('/consumers',methods=['GET','POST'])
 def consumers():
  c=config()
+ valid_types={'heater','motor','heat_pump','air_conditioner','pump','custom'}
+ def num(value, default=0, lo=0, hi=250000):
+  try: return min(hi,max(lo,int(float(value))))
+  except (ValueError,TypeError): return default
  if request.method=='POST':
-  names=request.form.getlist('consumer_name'); powers=request.form.getlist('consumer_power'); priorities=request.form.getlist('consumer_priority'); enabled=request.form.getlist('consumer_enabled')
-  for i,x in enumerate(c['consumers']):
-   try:x['name']=names[i].strip() or x['name'];x['nominal_power_w']=max(0,int(powers[i]));x['priority']=max(1,int(priorities[i]))
-   except (IndexError,ValueError):pass
-   x['enabled']=str(i) in enabled
+  remove_id=request.form.get('remove_consumer')
+  if remove_id:
+   c['consumers']=[x for x in c.get('consumers',[]) if str(x.get('id'))!=remove_id]
+   save(c); flash('Verbraucher entfernt. Lernhistorie und übrige Einstellungen bleiben erhalten.','success')
+   return redirect(url_for('consumers'))
+  ids=request.form.getlist('consumer_id')
+  names=request.form.getlist('consumer_name'); types=request.form.getlist('consumer_type')
+  powers=request.form.getlist('consumer_power'); priorities=request.form.getlist('consumer_priority')
+  enabled=request.form.getlist('consumer_enabled'); modes=request.form.getlist('consumer_mode')
+  stages_list=request.form.getlist('consumer_stages'); mins=request.form.getlist('consumer_min_power'); maxs=request.form.getlist('consumer_max_power')
+  sensors=request.form.getlist('consumer_pressure_sensor'); pmins=request.form.getlist('consumer_pressure_min'); pmaxs=request.form.getlist('consumer_pressure_max')
+  for i,x in enumerate(c.get('consumers',[])):
+   x.setdefault('id','consumer_'+str(i)); x['name']=(names[i].strip() if i<len(names) else x.get('name','Verbraucher')) or x.get('name','Verbraucher')
+   x['type']=types[i] if i<len(types) and types[i] in valid_types else x.get('type','custom')
+   x['nominal_power_w']=num(powers[i] if i<len(powers) else x.get('nominal_power_w',0),x.get('nominal_power_w',0))
+   x['priority']=num(priorities[i] if i<len(priorities) else x.get('priority',3),3,1,99)
+   x['enabled']=str(x['id']) in request.form.getlist('consumer_enabled') or str(i) in enabled
+   x['operation_mode']=modes[i] if i<len(modes) and modes[i] in ('staged','stepless') else x.get('operation_mode','staged')
+   raw=stages_list[i] if i<len(stages_list) else ''
+   try: parsed=sorted({num(v.strip(),0,1,x['nominal_power_w'] or 250000) for v in raw.replace(';',',').split(',') if v.strip()})
+   except Exception: parsed=[]
+   x['stages_w']=parsed if x['operation_mode']=='staged' else []
+   x['min_power_w']=num(mins[i] if i<len(mins) else x.get('min_power_w',0),0,0,x['nominal_power_w'])
+   x['max_power_w']=num(maxs[i] if i<len(maxs) else x.get('max_power_w',x['nominal_power_w']),x['nominal_power_w'],0,250000)
+   entity=(sensors[i].strip() if i<len(sensors) else x.get('pressure_sensor_entity',''))
+   x['pressure_sensor_entity']=entity if not entity or (entity.startswith(('sensor.','input_number.')) and ' ' not in entity) else ''
+   try:x['pressure_min_bar']=max(0.0,min(30.0,float(pmins[i]))) if i<len(pmins) and pmins[i].strip() else x.get('pressure_min_bar',4.5)
+   except ValueError:x['pressure_min_bar']=4.5
+   try:x['pressure_max_bar']=max(0.0,min(30.0,float(pmaxs[i]))) if i<len(pmaxs) and pmaxs[i].strip() else x.get('pressure_max_bar',7.0)
+   except ValueError:x['pressure_max_bar']=7.0
   name=request.form.get('new_name','').strip()
   if name:
-   try:p=max(0,int(request.form.get('new_power','0')))
-   except ValueError:p=0
-   c['consumers'].append({'id':'consumer_'+str(int(time.time())),'name':name,'type':'custom','enabled':True,'nominal_power_w':p,'stages_w':[],'priority':3})
-  slots=[]
-  for field in ('silage_slot_1','silage_slot_2','silage_slot_3'):
-   value=request.form.get(field,'').strip()
-   if value and len(value)==5 and value[2]==':' and value[:2].isdigit() and value[3:].isdigit() and 0<=int(value[:2])<=23 and 0<=int(value[3:])<=59: slots.append(value)
-  c['settings']['silage_slots']=slots
-  try:c['settings']['silage_flex_minutes']=min(180,max(0,int(request.form.get('silage_flex_minutes','45'))))
-  except ValueError:c['settings']['silage_flex_minutes']=45
-  try:c['settings']['silage_duration_minutes']=min(120,max(1,int(request.form.get('silage_duration_minutes','15'))))
-  except ValueError:c['settings']['silage_duration_minutes']=15
-  feeding=[]
-  for field in ('feeding_slot_1','feeding_slot_2','feeding_slot_3'):
-   value=request.form.get(field,'').strip()
-   if value and len(value)==5 and value[2]==':' and value[:2].isdigit() and value[3:].isdigit() and 0<=int(value[:2])<=23 and 0<=int(value[3:])<=59: feeding.append(value)
-  c['settings']['feeding_slots']=feeding
-  try:c['settings']['feeding_flex_minutes']=min(180,max(0,int(request.form.get('feeding_flex_minutes','10'))))
-  except ValueError:c['settings']['feeding_flex_minutes']=10
-  try:c['settings']['feeding_duration_minutes']=min(60,max(1,int(request.form.get('feeding_duration_minutes','8'))))
-  except ValueError:c['settings']['feeding_duration_minutes']=8
-  try:c['settings']['feeding_power_w']=min(100000,max(0,int(request.form.get('feeding_power_w','0'))))
-  except ValueError:c['settings']['feeding_power_w']=0
-  try:c['settings']['consumer_surplus_margin_w']=min(20000,max(0,int(request.form.get('consumer_surplus_margin_w','1000'))))
-  except ValueError:c['settings']['consumer_surplus_margin_w']=1000
-  save(c);flash('Verbraucher gespeichert. Nur die Silagefräse hat feste, frei einstellbare Sollzeiten; andere Verbraucher bleiben flexibel. Steuerung bleibt deaktiviert.','success');return render_template('consumers.html',cfg=c)
+   typ=request.form.get('new_type','custom'); typ=typ if typ in valid_types else 'custom'
+   power=num(request.form.get('new_power','0'))
+   mode=request.form.get('new_mode','staged'); mode=mode if mode in ('staged','stepless') else 'staged'
+   raw=request.form.get('new_stages','')
+   stages=sorted({num(v.strip(),0,1,power or 250000) for v in raw.replace(';',',').split(',') if v.strip()}) if mode=='staged' else []
+   entity=request.form.get('new_pressure_sensor','').strip()
+   if entity and not (entity.startswith(('sensor.','input_number.')) and ' ' not in entity): entity=''
+   c['consumers'].append({'id':'consumer_'+str(time.time_ns()),'name':name,'type':typ,'enabled':True,'nominal_power_w':power,'stages_w':stages,'priority':num(request.form.get('new_priority','3'),3,1,99),'operation_mode':mode,'min_power_w':num(request.form.get('new_min_power','0'),0,0,power),'max_power_w':num(request.form.get('new_max_power',str(power)),power,0,250000),'pressure_sensor_entity':entity,'pressure_min_bar':max(0.0,min(30.0,float(request.form.get('new_pressure_min','4.5') or 4.5))),'pressure_max_bar':max(0.0,min(30.0,float(request.form.get('new_pressure_max','7') or 7)) )})
+  save(c); flash('Verbraucher gespeichert. Die Angaben sind nur für Planung und Empfehlungen; es werden keine Geräte geschaltet.','success')
+  return redirect(url_for('consumers'))
  return render_template('consumers.html',cfg=c)
+
 def learn_load_patterns(rows, days=14, min_power_w=1000, min_days=3):
     """Learn recurring aggregate house-load patterns in local 15-minute slots.
 
