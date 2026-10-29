@@ -41,7 +41,7 @@ DEFAULT={'plant_name':'Meine Energiezentrale','sensors':{
 'battery_soc':{'label':'Batterieladezustand (SoC)','entity_id':'sensor.sofar_speicher_battery_soc','unit':'%'},
 'inverter_output':{'label':'Wechselrichter-Ausgangsleistung','entity_id':'sensor.sofar_speicher_active_power_output_total','unit':'W'},
 'pv_forecast':{'label':'PV-Prognose','entity_id':'sensor.solcast_pv_forecast_prognose_heute','unit':'Wh'}},
-'consumers':[{'id':'heater','name':'Elektroheizung','type':'heater','enabled':True,'nominal_power_w':30000,'stages_w':[7500,15000,22500,30000],'priority':1},{'id':'compressor','name':'Kompressor','type':'motor','enabled':True,'nominal_power_w':11000,'stages_w':[],'priority':2}],
+'consumers':[{'id':'heater','name':'Elektroheizung','type':'heater','enabled':True,'nominal_power_w':30000,'stages_w':[7500,15000,22500,30000],'priority':1,'temperature_sensor_entity':'','target_temperature_c':55.0},{'id':'compressor','name':'Kompressor','type':'motor','enabled':True,'nominal_power_w':11000,'stages_w':[],'priority':2,'pressure_sensor_entity':'','pressure_min_bar':4.5,'pressure_max_bar':7.0,'receiver_volume_l':500,'compressor_on_bar':6.0,'compressor_off_bar':8.0,'leak_monitor_enabled':True,'compressor_state_entity':'','temperature_sensor_entity':'','target_temperature_c':20.0}],
 'control_entities':{'mode':'select.sofar_speicher_inverter_energy_storage_mode','grid_setpoint':'number.sofar_speicher_inverter_passive_desired_grid_power','charge_power':'number.sofar_speicher_inverter_passive_maximum_battery_power','discharge_power':'number.sofar_speicher_inverter_passive_minimum_battery_power','apply_button':'button.sofar_speicher_inverter_passive_update_battery_charge_discharge'},'settings':{'grid_import_limit_w':5000,'battery_reserve_percent':25,'inverter_count':2,'control_enabled':False,'mode':'observe','grid_setpoint_sign':'unverified','grid_import_sign':'unverified','battery_power_sign':'negative','morning_start_hour':5,'morning_end_hour':9,'learning_days':14,'morning_min_samples_per_day':60,'battery_capacity_kwh':80,'battery_discharge_power_kw':30,'silage_slots':['06:30','12:00','18:00'],'silage_flex_minutes':45,'silage_duration_minutes':15,'feeding_slots':['06:45','12:00','18:15'],'feeding_flex_minutes':10,'feeding_duration_minutes':8,'feeding_power_w':0,'consumer_surplus_margin_w':1000,'import_price_eur_kwh':0.30,'export_price_eur_kwh':0.04,'tariff_effective_month':'','tariff_history':[],'battery_roundtrip_efficiency':0.90,'peak_alert_w':5000,'balance_alert_pct':15,'pv_forecast_mode':'daily_total'}}
 def config():
  if not CFG.exists(): CFG.write_text(json.dumps(DEFAULT,ensure_ascii=False,indent=2))
@@ -78,11 +78,24 @@ def get_value(eid):
  except (ValueError,TypeError):v=None
  return {'value':v,'state':s.get('state'),'unit':s.get('attributes',{}).get('unit_of_measurement',''),'updated':s.get('last_updated')}
 def snapshot():
- c=config(); return {'timestamp':datetime.now(timezone.utc).isoformat(),'values':{k:get_value(v.get('entity_id','')) for k,v in c['sensors'].items()}}
+ c=config()
+ values={k:get_value(v.get('entity_id','')) for k,v in c['sensors'].items()}
+ consumer_values={}
+ for consumer in c.get('consumers',[]):
+  cid=str(consumer.get('id',''))
+  if not cid: continue
+  cv={}
+  for key in ('pressure_sensor_entity','temperature_sensor_entity','compressor_state_entity'):
+   entity=consumer.get(key,'')
+   if entity:
+    cv[key]=get_value(entity)
+  if cv: consumer_values[cid]=cv
+ return {'timestamp':datetime.now(timezone.utc).isoformat(),'values':values,'consumer_values':consumer_values}
 def sampler():
  while True:
   try:
-   s=snapshot(); row={'timestamp':s['timestamp'],'values':{k:(v or {}).get('value') for k,v in s['values'].items()}}
+   s=snapshot(); row={'timestamp':s['timestamp'],'values':{k:(v or {}).get('value') for k,v in s['values'].items()},
+             'consumer_values':{cid:{key:(val or {}).get('value') for key,val in vals.items()} for cid,vals in s.get('consumer_values',{}).items()}}
    with HIST.open('a') as f:f.write(json.dumps(row)+'\n')
    if HIST.stat().st_size>15000000:
     lines=HIST.read_text().splitlines()[-10000:]; HIST.write_text('\n'.join(lines)+'\n')
@@ -326,6 +339,9 @@ def consumers():
   enabled=request.form.getlist('consumer_enabled'); modes=request.form.getlist('consumer_mode')
   stages_list=request.form.getlist('consumer_stages'); mins=request.form.getlist('consumer_min_power'); maxs=request.form.getlist('consumer_max_power')
   sensors=request.form.getlist('consumer_pressure_sensor'); pmins=request.form.getlist('consumer_pressure_min'); pmaxs=request.form.getlist('consumer_pressure_max')
+  volumes=request.form.getlist('consumer_receiver_volume'); onbars=request.form.getlist('consumer_on_bar'); offbars=request.form.getlist('consumer_off_bar')
+  leakflags=request.form.getlist('consumer_leak_monitor'); states=request.form.getlist('consumer_state_sensor')
+  temps=request.form.getlist('consumer_temperature_sensor'); targets=request.form.getlist('consumer_target_temperature')
   for i,x in enumerate(c.get('consumers',[])):
    x.setdefault('id','consumer_'+str(i)); x['name']=(names[i].strip() if i<len(names) else x.get('name','Verbraucher')) or x.get('name','Verbraucher')
    x['type']=types[i] if i<len(types) and types[i] in valid_types else x.get('type','custom')
@@ -345,6 +361,19 @@ def consumers():
    except ValueError:x['pressure_min_bar']=4.5
    try:x['pressure_max_bar']=max(0.0,min(30.0,float(pmaxs[i]))) if i<len(pmaxs) and pmaxs[i].strip() else x.get('pressure_max_bar',7.0)
    except ValueError:x['pressure_max_bar']=7.0
+   def valid_entity(value):
+    value=(value or '').strip()
+    return value if not value or (value.startswith(('sensor.','input_number.','binary_sensor.')) and ' ' not in value) else ''
+   x['receiver_volume_l']=num(volumes[i] if i<len(volumes) else x.get('receiver_volume_l',500),500,1,100000)
+   try:x['compressor_on_bar']=max(0.0,min(30.0,float(onbars[i]))) if i<len(onbars) and onbars[i].strip() else x.get('compressor_on_bar',6.0)
+   except ValueError:x['compressor_on_bar']=6.0
+   try:x['compressor_off_bar']=max(0.0,min(30.0,float(offbars[i]))) if i<len(offbars) and offbars[i].strip() else x.get('compressor_off_bar',8.0)
+   except ValueError:x['compressor_off_bar']=8.0
+   x['leak_monitor_enabled']=str(x['id']) in request.form.getlist('consumer_leak_monitor')
+   x['compressor_state_entity']=valid_entity(states[i] if i<len(states) else x.get('compressor_state_entity',''))
+   x['temperature_sensor_entity']=valid_entity(temps[i] if i<len(temps) else x.get('temperature_sensor_entity',''))
+   try:x['target_temperature_c']=max(-20.0,min(100.0,float(targets[i]))) if i<len(targets) and targets[i].strip() else x.get('target_temperature_c',20.0)
+   except ValueError:x['target_temperature_c']=20.0
   name=request.form.get('new_name','').strip()
   if name:
    typ=request.form.get('new_type','custom'); typ=typ if typ in valid_types else 'custom'
@@ -354,7 +383,14 @@ def consumers():
    stages=sorted({num(v.strip(),0,1,power or 250000) for v in raw.replace(';',',').split(',') if v.strip()}) if mode=='staged' else []
    entity=request.form.get('new_pressure_sensor','').strip()
    if entity and not (entity.startswith(('sensor.','input_number.')) and ' ' not in entity): entity=''
-   c['consumers'].append({'id':'consumer_'+str(time.time_ns()),'name':name,'type':typ,'enabled':True,'nominal_power_w':power,'stages_w':stages,'priority':num(request.form.get('new_priority','3'),3,1,99),'operation_mode':mode,'min_power_w':num(request.form.get('new_min_power','0'),0,0,power),'max_power_w':num(request.form.get('new_max_power',str(power)),power,0,250000),'pressure_sensor_entity':entity,'pressure_min_bar':max(0.0,min(30.0,float(request.form.get('new_pressure_min','4.5') or 4.5))),'pressure_max_bar':max(0.0,min(30.0,float(request.form.get('new_pressure_max','7') or 7)) )})
+   c['consumers'].append({'id':'consumer_'+str(time.time_ns()),'name':name,'type':typ,'enabled':True,'nominal_power_w':power,'stages_w':stages,'priority':num(request.form.get('new_priority','3'),3,1,99),'operation_mode':mode,'min_power_w':num(request.form.get('new_min_power','0'),0,0,power),'max_power_w':num(request.form.get('new_max_power',str(power)),power,0,250000),'pressure_sensor_entity':entity,'pressure_min_bar':max(0.0,min(30.0,float(request.form.get('new_pressure_min','4.5') or 4.5))),'pressure_max_bar':max(0.0,min(30.0,float(request.form.get('new_pressure_max','7') or 7))),
+    'receiver_volume_l':num(request.form.get('new_receiver_volume','500'),500,1,100000),
+    'compressor_on_bar':max(0.0,min(30.0,float(request.form.get('new_on_bar','6') or 6))),
+    'compressor_off_bar':max(0.0,min(30.0,float(request.form.get('new_off_bar','8') or 8))),
+    'leak_monitor_enabled':request.form.get('new_leak_monitor')=='on',
+    'compressor_state_entity':request.form.get('new_state_sensor','').strip(),
+    'temperature_sensor_entity':request.form.get('new_temperature_sensor','').strip(),
+    'target_temperature_c':max(-20.0,min(100.0,float(request.form.get('new_target_temperature','20') or 20)))})
   save(c); flash('Verbraucher gespeichert. Die Angaben sind nur für Planung und Empfehlungen; es werden keine Geräte geschaltet.','success')
   return redirect(url_for('consumers'))
  return render_template('consumers.html',cfg=c)
@@ -518,13 +554,30 @@ def api_consumer_plan():
             nominal = max(0, int(consumer.get('nominal_power_w', 0)))
             options = [v for v in stages if v <= remaining]
             chosen = max(options) if options else (nominal if nominal and nominal <= remaining else 0)
+            pressure = get_value(consumer.get('pressure_sensor_entity','')) if consumer.get('pressure_sensor_entity') else None
+            temp = get_value(consumer.get('temperature_sensor_entity','')) if consumer.get('temperature_sensor_entity') else None
+            note = (f'{chosen} W passen rechnerisch in den verfügbaren Überschuss.' if chosen > 0
+                    else 'Der verfügbare Überschuss reicht mit Sicherheitsabstand nicht für eine Stufe.')
+            if pressure and pressure.get('value') is not None:
+                pv = pressure['value']
+                note += f' Drucksensor: {pv:.1f} bar.'
+                if consumer.get('type') == 'motor' and pv < float(consumer.get('pressure_min_bar',4.5)):
+                    note = f'Druck unter Mindestwert ({pv:.1f} bar): Kompressorbedarf hat Vorrang. ' + note
+            if temp and temp.get('value') is not None:
+                tv = temp['value']
+                target = float(consumer.get('target_temperature_c',20.0))
+                note += f' Temperatur: {tv:.1f} °C (Ziel {target:.1f} °C).'
+                if consumer.get('type') in ('heater','heat_pump') and tv >= target:
+                    chosen = 0
+                    note = f'Temperaturziel erreicht ({tv:.1f} °C); keine zusätzliche Heizempfehlung.'
             recommendations.append({
                 'id': consumer.get('id'), 'name': consumer.get('name', 'Verbraucher'),
                 'priority': int(consumer.get('priority', 99)), 'nominal_power_w': nominal,
                 'suggested_power_w': chosen,
                 'status': 'fits' if chosen > 0 else 'wait',
-                'note': (f'{chosen} W passen rechnerisch in den verfügbaren Überschuss.' if chosen > 0
-                         else 'Der verfügbare Überschuss reicht mit Sicherheitsabstand nicht für eine Stufe.')
+                'pressure_bar': pressure.get('value') if pressure else None,
+                'temperature_c': temp.get('value') if temp else None,
+                'note': note
             })
             remaining = max(0.0, remaining - chosen)
     return jsonify({
@@ -535,6 +588,46 @@ def api_consumer_plan():
         'warning': ('Netzleistungs-Vorzeichen erst in der Konfiguration bestätigen.' if export_w is None else
                     'Nur Vorschlag: keine Verbraucher werden geschaltet. Vor dem Betrieb Anlaufstrom, Mindestlaufzeiten und Verriegelungen berücksichtigen.')
     })
+
+@app.route('/api/compressor-analysis')
+def api_compressor_analysis():
+    """Estimate receiver pressure decay from stored samples; never claims a confirmed leak."""
+    c=config(); now=time.time(); results=[]
+    try: rows=[json.loads(line) for line in HIST.read_text().splitlines()[-50000:] if line.strip()] if HIST.exists() else []
+    except Exception: rows=[]
+    for consumer in c.get('consumers',[]):
+        if consumer.get('type')!='motor' or not consumer.get('pressure_sensor_entity') or not consumer.get('leak_monitor_enabled',True):
+            continue
+        cid=str(consumer.get('id','')); entity=consumer.get('pressure_sensor_entity')
+        points=[]
+        for row in rows:
+            cv=row.get('consumer_values',{}).get(cid,{})
+            val=cv.get('pressure_sensor_entity')
+            try: ts=datetime.fromisoformat(row.get('timestamp','').replace('Z','+00:00')).timestamp(); p=float(val)
+            except (TypeError,ValueError): continue
+            if now-12*3600 <= ts <= now and 0 <= p <= 30: points.append((ts,p))
+        points.sort()
+        # Compare early and late medians over the last 12 hours; this is a screening estimate only.
+        loss=None; rate=None; span=0
+        if len(points)>=8:
+            span=(points[-1][0]-points[0][0])/3600
+            if span>=1:
+                n=max(3,len(points)//5)
+                drop=statistics.median(p for _,p in points[:n])-statistics.median(p for _,p in points[-n:])
+                if drop>0:
+                    rate=drop/span
+                    volume=max(1,float(consumer.get('receiver_volume_l',500)))
+                    loss=volume*rate # approximate free-air L/h, gauge pressure drop approximation
+        current=get_value(entity)
+        results.append({'id':cid,'name':consumer.get('name','Kompressor'),'receiver_volume_l':consumer.get('receiver_volume_l',500),
+            'pressure_bar':current.get('value') if current else None,'pressure_min_bar':consumer.get('pressure_min_bar',4.5),
+            'compressor_on_bar':consumer.get('compressor_on_bar',6),'compressor_off_bar':consumer.get('compressor_off_bar',8),
+            'pressure_drop_bar_per_hour':round(rate,3) if rate is not None else None,
+            'estimated_air_loss_l_per_hour':round(loss,1) if loss is not None else None,
+            'sample_span_hours':round(span,1),'samples':len(points),
+            'status':'Verdacht auf Druckverlust' if loss is not None and loss>=max(20,volume*0.1) else ('Noch zu wenig Messdaten' if loss is None else 'Kein auffälliger Druckabfall erkannt'),
+            'warning':'Schätzwert: Temperaturänderungen und unbemerkter Luftverbrauch können den Druckabfall erklären. Für aussagekräftige Messungen Kompressor-Aus-Zeiten und druckluftfreie Zeiträume berücksichtigen.'})
+    return jsonify({'timestamp':datetime.now(timezone.utc).isoformat(),'results':results,'commands_sent':False})
 
 @app.route('/api/battery-plan')
 def api_battery_plan():
