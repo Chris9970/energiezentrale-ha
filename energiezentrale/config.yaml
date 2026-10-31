@@ -1,7 +1,7 @@
 name: "Energiezentrale"
-version: "1.2.18"
+version: "1.2.20"
 slug: "energiezentrale"
-description: "Energiezentrale 1.2.18 mit lokales trainiertes neuronales Netz für Lastprognosen; beratend und nur lesend"
+description: "Energiezentrale 1.2.20 mit lokales trainiertes neuronales Netz für Lastprognosen; beratend und nur lesend"
 arch: [aarch64, amd64]
 startup: application
 boot: auto

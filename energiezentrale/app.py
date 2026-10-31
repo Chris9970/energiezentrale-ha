@@ -515,9 +515,131 @@ def train_load_mlp(rows, force=False):
             'model':model['model'],'trained_at':model.get('trained_at'),'architecture':'6 Eingänge · 8 Neuronen · 1 Ausgang',
             'target':'Hausverbrauch in ca. 10 Sekunden; selbstüberwachtes Prognose-Training'}
 
+# Multi-channel next-sample forecasts. Separate models preserve the legacy load MLP.
+BRAIN_MULTI_MODEL = DATA / 'brain_multichannel_model.json'
+BRAIN_CHANNELS = {
+    'load_power': ('Hauslast', 250000, True),
+    'pv_power': ('PV-Leistung', 250000, True),
+    'grid_power': ('Netzleistung', 250000, False),
+    'battery_power': ('Batterieleistung', 100000, False),
+}
+
+def train_multichannel_mlp(rows, force=False):
+    result=[]; models={}; signatures={}
+    old={}
+    try: old=json.loads(BRAIN_MULTI_MODEL.read_text())
+    except Exception: pass
+    for key,(label,scale,nonnegative) in BRAIN_CHANNELS.items():
+        vals=[]
+        for row in rows[-50000:]:
+            try:
+                ts=datetime.fromisoformat(row.get('timestamp','').replace('Z','+00:00')).timestamp()
+                v=float((row.get('values') or {}).get(key))
+                if abs(v)<=scale and (not nonnegative or v>=0): vals.append((ts,v))
+            except (ValueError,TypeError,OverflowError): continue
+        seq=[]
+        for i in range(6,len(vals)):
+            w=vals[i-6:i+1]
+            if all(5 <= w[j+1][0]-w[j][0] <= 20 for j in range(6)):
+                seq.append(([x[1]/scale for x in w[:6]],w[6][1]/scale))
+        sig=len(seq); signatures[key]=sig
+        if sig < 120:
+            if isinstance(old.get('channels',{}).get(key),dict): models[key]=old['channels'][key]
+            result.append({'key':key,'label':label,'trained':False,'samples':sig,'mae_w':None,'next_w':None,'status':'Zu wenige zusammenhängende Messwerte'})
+            continue
+        split=max(100,int(sig*.8)); train_seq=seq[:split]; test_seq=seq[split:] or seq[-min(100,len(seq)):]
+        model=old.get('channels',{}).get(key)
+        if force or not isinstance(model,dict) or model.get('version')!=1 or sig-int(model.get('training_samples',0))>=500:
+            h=8; w1=[[((((i+1)*(j+3))%17)-8)*.006 for i in range(6)] for j in range(h)]
+            b1=[0.0]*h; w2=[((((j+2)%7)-3)*.01) for j in range(h)]; b2=0.0; lr=.015
+            for epoch in range(9):
+                for x,y in train_seq:
+                    hidden=[_sigmoid_tanh(sum(w1[j][k]*x[k] for k in range(6))+b1[j]) for j in range(h)]
+                    pred=sum(w2[j]*hidden[j] for j in range(h))+b2; err=max(-1.5,min(1.5,pred-y)); ow=w2[:]
+                    for j in range(h):
+                        grad=err*ow[j]*(1-hidden[j]*hidden[j])
+                        w1[j]=[w1[j][k]-lr*grad*x[k] for k in range(6)]; b1[j]-=lr*grad; w2[j]-=lr*err*hidden[j]
+                    b2-=lr*err
+            model={'version':1,'training_samples':sig,'trained_at':datetime.now(timezone.utc).isoformat(),'w1':w1,'b1':b1,'w2':w2,'b2':b2}
+        def pred(x):
+            hidden=[_sigmoid_tanh(sum(model['w1'][j][k]*x[k] for k in range(6))+model['b1'][j]) for j in range(8)]
+            return sum(model['w2'][j]*hidden[j] for j in range(8))+model['b2']
+        mae=sum(abs(pred(x)-y)*scale for x,y in test_seq)/len(test_seq)
+        nxt=pred([v/scale for _,v in vals[-6:]])*scale if len(vals)>=6 else None
+        if nonnegative and nxt is not None: nxt=max(0,nxt)
+        models[key]=model
+        result.append({'key':key,'label':label,'trained':True,'samples':sig,'training_samples':len(train_seq),'validation_samples':len(test_seq),'mae_w':round(mae),'next_w':round(nxt) if nxt is not None else None,'status':'Trainiert · Zukunftsprüfung'})
+    if models:
+        try:
+            tmp=BRAIN_MULTI_MODEL.with_suffix('.tmp'); tmp.write_text(json.dumps({'version':1,'channels':models,'signatures':signatures})); tmp.replace(BRAIN_MULTI_MODEL)
+        except Exception: pass
+    return {'channels':result,'model':'MLP je Energiekanal','architecture':'je Kanal: 6 Messwerte · 8 Neuronen · 1 Ausgang','target':'Nächster Messwert je Kanal (ca. 10 Sekunden)','trained_channels':sum(1 for x in result if x['trained'])}
+
+# Multi-channel next-sample forecasts. Separate models preserve the legacy load MLP.
+BRAIN_MULTI_MODEL = DATA / 'brain_multichannel_model.json'
+BRAIN_CHANNELS = {
+    'load_power': ('Hauslast', 250000, True),
+    'pv_power': ('PV-Leistung', 250000, True),
+    'grid_power': ('Netzleistung', 250000, False),
+    'battery_power': ('Batterieleistung', 100000, False),
+}
+
+def train_multichannel_mlp(rows, force=False):
+    result=[]; models={}; signatures={}
+    old={}
+    try: old=json.loads(BRAIN_MULTI_MODEL.read_text())
+    except Exception: pass
+    for key,(label,scale,nonnegative) in BRAIN_CHANNELS.items():
+        vals=[]
+        for row in rows[-50000:]:
+            try:
+                ts=datetime.fromisoformat(row.get('timestamp','').replace('Z','+00:00')).timestamp()
+                v=float((row.get('values') or {}).get(key))
+                if abs(v)<=scale and (not nonnegative or v>=0): vals.append((ts,v))
+            except (ValueError,TypeError,OverflowError): continue
+        seq=[]
+        for i in range(6,len(vals)):
+            w=vals[i-6:i+1]
+            if all(5 <= w[j+1][0]-w[j][0] <= 20 for j in range(6)):
+                seq.append(([x[1]/scale for x in w[:6]],w[6][1]/scale))
+        sig=len(seq); signatures[key]=sig
+        if sig < 120:
+            if isinstance(old.get('channels',{}).get(key),dict): models[key]=old['channels'][key]
+            result.append({'key':key,'label':label,'trained':False,'samples':sig,'mae_w':None,'next_w':None,'status':'Zu wenige zusammenhängende Messwerte'})
+            continue
+        split=max(100,int(sig*.8)); train_seq=seq[:split]; test_seq=seq[split:] or seq[-min(100,len(seq)):]
+        model=old.get('channels',{}).get(key)
+        if force or not isinstance(model,dict) or model.get('version')!=1 or sig-int(model.get('training_samples',0))>=500:
+            h=8; w1=[[((((i+1)*(j+3))%17)-8)*.006 for i in range(6)] for j in range(h)]
+            b1=[0.0]*h; w2=[((((j+2)%7)-3)*.01) for j in range(h)]; b2=0.0; lr=.015
+            for epoch in range(9):
+                for x,y in train_seq:
+                    hidden=[_sigmoid_tanh(sum(w1[j][k]*x[k] for k in range(6))+b1[j]) for j in range(h)]
+                    pred=sum(w2[j]*hidden[j] for j in range(h))+b2; err=max(-1.5,min(1.5,pred-y)); ow=w2[:]
+                    for j in range(h):
+                        grad=err*ow[j]*(1-hidden[j]*hidden[j])
+                        w1[j]=[w1[j][k]-lr*grad*x[k] for k in range(6)]; b1[j]-=lr*grad; w2[j]-=lr*err*hidden[j]
+                    b2-=lr*err
+            model={'version':1,'training_samples':sig,'trained_at':datetime.now(timezone.utc).isoformat(),'w1':w1,'b1':b1,'w2':w2,'b2':b2}
+        def pred(x):
+            hidden=[_sigmoid_tanh(sum(model['w1'][j][k]*x[k] for k in range(6))+model['b1'][j]) for j in range(8)]
+            return sum(model['w2'][j]*hidden[j] for j in range(8))+model['b2']
+        mae=sum(abs(pred(x)-y)*scale for x,y in test_seq)/len(test_seq)
+        nxt=pred([v/scale for _,v in vals[-6:]])*scale if len(vals)>=6 else None
+        if nonnegative and nxt is not None: nxt=max(0,nxt)
+        models[key]=model
+        result.append({'key':key,'label':label,'trained':True,'samples':sig,'training_samples':len(train_seq),'validation_samples':len(test_seq),'mae_w':round(mae),'next_w':round(nxt) if nxt is not None else None,'status':'Trainiert · Zukunftsprüfung'})
+    if models:
+        try:
+            tmp=BRAIN_MULTI_MODEL.with_suffix('.tmp'); tmp.write_text(json.dumps({'version':1,'channels':models,'signatures':signatures})); tmp.replace(BRAIN_MULTI_MODEL)
+        except Exception: pass
+    return {'channels':result,'model':'MLP je Energiekanal','architecture':'je Kanal: 6 Messwerte · 8 Neuronen · 1 Ausgang','target':'Nächster Messwert je Kanal (ca. 10 Sekunden)','trained_channels':sum(1 for x in result if x['trained'])}
+
 # Energy Brain: local, explainable unsupervised load-event learning. No cloud/commands.
 def build_energy_brain(rows):
     neural=train_load_mlp(rows)
+    multichannel=train_multichannel_mlp(rows)
+    multichannel=train_multichannel_mlp(rows)
     events=[]; prev=None
     for row in rows[-50000:]:
         try:
@@ -616,13 +738,13 @@ def build_energy_brain(rows):
             ta=datetime.fromisoformat(a['timestamp'].replace('Z','+00:00')).timestamp(); tb=datetime.fromisoformat(b['timestamp'].replace('Z','+00:00')).timestamp();
             if tb-ta>30: gaps.append(tb-ta)
         except Exception: pass
-    return {'engine':'Energy Brain local v2','method':'Lastsprungerkennung + Multi-Kanal-Merkmale + zeitlich begrenzte Start/Ende-Paarung und Dauer-/Leistungs-Clustering',
+    return {'engine':'Energy Brain local v3','method':'Anlagenweite Musteranalyse aus Hauslast, Netz, Batterie und PV; Lastsprünge und Zyklusprofile sind erklärbare statistische Merkmale. Das neuronale Netz prognostiziert den aggregierten Hausverbrauch. Geräteidentitäten sind ausdrücklich nicht erforderlich.',
       'samples_used':min(len(rows),50000),'events_found':len(events),'profiles':profiles,
       'paired_cycles_found':len(cycles),'cycle_profiles':learned_cycles,
       'data_gaps_over_30s':len(gaps),'sample_interval_target_seconds':10,
       'status':'Lernphase – Muster werden mit mehr Wiederholungen stabiler',
-      'limitations':['Ein Lastsprung ist noch keine sichere Maschinenidentifikation.','Zykluslaufzeiten sind heuristische Zuordnungen innerhalb eines 45-Minuten-Fensters; überlagerte Verbraucher können sie weiterhin verfälschen.','Bei gleichzeitigen Verbrauchern können sich Laständerungen überlagern.'],
-      'neural_network':neural,'active_control_enabled':False,'commands_sent':False}
+      'limitations':['Das Ziel ist die Erkennung wiederkehrender Anlagen- und Energiemuster; Gerätenamen oder manuelle Gerätezuordnungen sind nicht erforderlich.','Zykluslaufzeiten sind heuristische Zuordnungen innerhalb eines 45-Minuten-Fensters; überlagerte Lasten können sie weiterhin verfälschen.','Das neuronale Netz prognostiziert aktuell den aggregierten Hausverbrauch und klassifiziert noch keine Betriebszustände.','Prognosen und Profile sind Beobachtungswerte, keine Steuerentscheidungen.'],
+      'neural_network':neural, 'multichannel_forecast':multichannel, 'multichannel_forecast':multichannel,'active_control_enabled':False,'commands_sent':False}
 
 @app.route('/energy-brain')
 def energy_brain():
