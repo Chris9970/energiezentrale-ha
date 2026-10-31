@@ -469,9 +469,14 @@ def train_load_mlp(rows, force=False):
     if len(seq)<120:
         return {'trained':False,'status':'Zu wenige zusammenhängende Messwerte','training_samples':len(seq),'mae_w':None,'next_load_prediction_w':None,'model':'MLP 6-8-1'}
     signature=len(seq)
+    # Chronological holdout: the newest 20% are reserved for evaluation,
+    # so the displayed MAE measures unseen future samples rather than training fit.
+    split=max(100, int(len(seq)*0.8))
+    train_seq=seq[:split]
+    test_seq=seq[split:] or seq[-min(100,len(seq)):]
     try:
         old=json.loads(BRAIN_MODEL.read_text())
-        if not force and old.get('training_samples')==signature:
+        if not force and old.get('training_samples')==signature and old.get('version')==2:
             model=old
         else: model=None
     except Exception: model=None
@@ -482,7 +487,7 @@ def train_load_mlp(rows, force=False):
         lr=0.018
         # Fixed ordering keeps the local training reproducible.
         for epoch in range(7):
-            for x,y in seq:
+            for x,y in train_seq:
                 hidden=[_sigmoid_tanh(sum(w1[j][k]*x[k] for k in range(6))+b1[j]) for j in range(h)]
                 pred=sum(w2[j]*hidden[j] for j in range(h))+b2
                 err=max(-1.5,min(1.5,pred-y))
@@ -493,20 +498,20 @@ def train_load_mlp(rows, force=False):
                     b1[j]-=lr*grad
                     w2[j]-=lr*err*hidden[j]
                 b2-=lr*err
-        model={'model':'MLP 6-8-1','version':1,'trained_at':datetime.now(timezone.utc).isoformat(),
-               'training_samples':signature,'w1':w1,'b1':b1,'w2':w2,'b2':b2}
+        model={'model':'MLP 6-8-1','version':2,'trained_at':datetime.now(timezone.utc).isoformat(),
+               'training_samples':signature,'training_sequences':len(train_seq),'validation_sequences':len(test_seq),'w1':w1,'b1':b1,'w2':w2,'b2':b2}
         try:
             tmp=BRAIN_MODEL.with_suffix('.tmp'); tmp.write_text(json.dumps(model)); tmp.replace(BRAIN_MODEL)
         except Exception: pass
     def predict(x):
         hidden=[_sigmoid_tanh(sum(model['w1'][j][k]*x[k] for k in range(6))+model['b1'][j]) for j in range(8)]
         return sum(model['w2'][j]*hidden[j] for j in range(8))+model['b2']
-    check=seq[-min(500,len(seq)):]
+    check=test_seq
     mae=sum(abs(predict(x)-y)*20000.0 for x,y in check)/len(check)
     latest=[v/20000.0 for _,v in valid[-6:]]
     next_w=max(0.0,predict(latest)*20000.0) if len(latest)==6 else None
     return {'trained':True,'status':'Neuronales Netz trainiert' if model.get('training_samples')==signature else 'Neuronales Netz aktiv',
-            'training_samples':signature,'mae_w':round(mae),'next_load_prediction_w':round(next_w) if next_w is not None else None,
+            'training_samples':signature,'training_sequences':len(train_seq),'validation_sequences':len(test_seq),'mae_w':round(mae),'next_load_prediction_w':round(next_w) if next_w is not None else None,
             'model':model['model'],'trained_at':model.get('trained_at'),'architecture':'6 Eingänge · 8 Neuronen · 1 Ausgang',
             'target':'Hausverbrauch in ca. 10 Sekunden; selbstüberwachtes Prognose-Training'}
 
@@ -547,6 +552,42 @@ def build_energy_brain(rows):
         profiles.append({'id':f'P{i:02d}','direction':c['direction'],'mean_step_w':round(c['mean_w']),
           'events':n,'confidence':confidence,'typical_times':hours[:8],
           'explanation':f'{n} ähnliche {c["direction"].lower()}-Ereignisse; mittlere Änderung etwa {round(c["mean_w"])} W. Verbraucheridentität nicht bekannt.'})
+    # Pair positive load steps with the next plausible negative step of similar size.
+    # This estimates operating-cycle duration; it does not identify the machine.
+    rises=sorted([e for e in events if e['delta']>0], key=lambda e:e['ts'])
+    falls=sorted([e for e in events if e['delta']<0], key=lambda e:e['ts'])
+    used_falls=set(); cycles=[]
+    for rise in rises:
+        candidates=[]
+        for idx,fall in enumerate(falls):
+            if idx in used_falls or fall['ts'] <= rise['ts']: continue
+            duration=fall['ts']-rise['ts']
+            if duration > 6*3600: break
+            magnitude=abs(rise['delta']); endmag=abs(fall['delta'])
+            tolerance=max(1800, magnitude*0.25)
+            if abs(magnitude-endmag) <= tolerance:
+                candidates.append((duration,idx,fall))
+        if candidates:
+            duration,idx,fall=min(candidates,key=lambda x:x[0])
+            used_falls.add(idx)
+            cycles.append({'start_ts':rise['ts'],'duration_s':duration,'power_w':(abs(rise['delta'])+abs(fall['delta']))/2})
+    cycle_groups=[]
+    for cycle in cycles:
+        match=None
+        for group in cycle_groups:
+            if abs(cycle['power_w']-group['mean_power_w']) <= max(1800,group['mean_power_w']*.25):
+                match=group; break
+        if match is None:
+            match={'mean_power_w':cycle['power_w'],'items':[]}; cycle_groups.append(match)
+        match['items'].append(cycle)
+        match['mean_power_w']=sum(x['power_w'] for x in match['items'])/len(match['items'])
+    learned_cycles=[]
+    for i,g in enumerate(sorted(cycle_groups,key=lambda x:len(x['items']),reverse=True)[:10],1):
+        items=g['items']; durations=[x['duration_s'] for x in items]
+        learned_cycles.append({'id':f'Z{i:02d}','cycles':len(items),'mean_power_w':round(g['mean_power_w']),
+            'median_duration_s':round(statistics.median(durations)),
+            'confidence':'vorläufig' if len(items)<5 else 'mittel' if len(items)<15 else 'hoch',
+            'times':[datetime.fromtimestamp(x['start_ts'],timezone.utc).astimezone().strftime('%H:%M') for x in items[:8]]})
     # Coarse data quality summary
     gaps=[]
     for a,b in zip(rows[-50000:],rows[-50000:][1:]):
@@ -554,8 +595,9 @@ def build_energy_brain(rows):
             ta=datetime.fromisoformat(a['timestamp'].replace('Z','+00:00')).timestamp(); tb=datetime.fromisoformat(b['timestamp'].replace('Z','+00:00')).timestamp();
             if tb-ta>30: gaps.append(tb-ta)
         except Exception: pass
-    return {'engine':'Energy Brain local v1','method':'change-point detection + transparent greedy clustering',
+    return {'engine':'Energy Brain local v1','method':'Lastsprungerkennung + erklärbares Clustering + heuristische Start/Ende-Paarung',
       'samples_used':min(len(rows),50000),'events_found':len(events),'profiles':profiles,
+      'paired_cycles_found':len(cycles),'cycle_profiles':learned_cycles,
       'data_gaps_over_30s':len(gaps),'sample_interval_target_seconds':10,
       'status':'Lernphase – Muster werden mit mehr Wiederholungen stabiler',
       'limitations':['Ein Lastsprung ist noch keine sichere Maschinenidentifikation.','Laufzeiten werden erst zuverlässig messbar, wenn Start und Ende im Verlauf erkannt werden.','Bei gleichzeitigen Verbrauchern können sich Laständerungen überlagern.'],
