@@ -443,8 +443,76 @@ def learn_load_patterns(rows, days=14, min_power_w=1000, min_days=3):
 
 
 
+# Tiny trainable neural network (one hidden layer), implemented with Python stdlib.
+# Self-supervised next-sample forecasting: previous six load samples -> next load.
+# This is a real trained MLP, but it predicts aggregate load; it does not label appliances.
+BRAIN_MODEL = DATA / 'brain_mlp_model.json'
+
+def _sigmoid_tanh(x):
+    x=max(-20.0,min(20.0,x))
+    return (2.0/(1.0+pow(2.718281828459045,-2.0*x)))-1.0
+
+def train_load_mlp(rows, force=False):
+    valid=[]
+    for row in rows[-50000:]:
+        try:
+            ts=datetime.fromisoformat(row.get('timestamp','').replace('Z','+00:00')).timestamp()
+            v=float((row.get('values') or {}).get('load_power'))
+            if 0 <= v <= 250000: valid.append((ts,v))
+        except (ValueError,TypeError,OverflowError): continue
+    # Only build sequences from near-regular samples; discard gaps.
+    seq=[]
+    for i in range(6,len(valid)):
+        window=valid[i-6:i+1]
+        if all(5 <= window[j+1][0]-window[j][0] <= 20 for j in range(6)):
+            seq.append(([x[1]/20000.0 for x in window[:6]],window[6][1]/20000.0))
+    if len(seq)<120:
+        return {'trained':False,'status':'Zu wenige zusammenhängende Messwerte','training_samples':len(seq),'mae_w':None,'next_load_prediction_w':None,'model':'MLP 6-8-1'}
+    signature=len(seq)
+    try:
+        old=json.loads(BRAIN_MODEL.read_text())
+        if not force and old.get('training_samples')==signature:
+            model=old
+        else: model=None
+    except Exception: model=None
+    if model is None:
+        # Deterministic small initial weights, no external packages or network.
+        h=8; w1=[[(((i+1)*(j+3)%17)-8)*0.006 for i in range(6)] for j in range(h)]
+        b1=[0.0]*h; w2=[(((j+2)%7)-3)*0.01 for j in range(h)]; b2=0.0
+        lr=0.018
+        # Fixed ordering keeps the local training reproducible.
+        for epoch in range(7):
+            for x,y in seq:
+                hidden=[_sigmoid_tanh(sum(w1[j][k]*x[k] for k in range(6))+b1[j]) for j in range(h)]
+                pred=sum(w2[j]*hidden[j] for j in range(h))+b2
+                err=max(-1.5,min(1.5,pred-y))
+                old_w2=w2[:]
+                for j in range(h):
+                    grad=err*old_w2[j]*(1-hidden[j]*hidden[j])
+                    w1[j]=[w1[j][k]-lr*grad*x[k] for k in range(6)]
+                    b1[j]-=lr*grad
+                    w2[j]-=lr*err*hidden[j]
+                b2-=lr*err
+        model={'model':'MLP 6-8-1','version':1,'trained_at':datetime.now(timezone.utc).isoformat(),
+               'training_samples':signature,'w1':w1,'b1':b1,'w2':w2,'b2':b2}
+        try:
+            tmp=BRAIN_MODEL.with_suffix('.tmp'); tmp.write_text(json.dumps(model)); tmp.replace(BRAIN_MODEL)
+        except Exception: pass
+    def predict(x):
+        hidden=[_sigmoid_tanh(sum(model['w1'][j][k]*x[k] for k in range(6))+model['b1'][j]) for j in range(8)]
+        return sum(model['w2'][j]*hidden[j] for j in range(8))+model['b2']
+    check=seq[-min(500,len(seq)):]
+    mae=sum(abs(predict(x)-y)*20000.0 for x,y in check)/len(check)
+    latest=[v/20000.0 for _,v in valid[-6:]]
+    next_w=max(0.0,predict(latest)*20000.0) if len(latest)==6 else None
+    return {'trained':True,'status':'Neuronales Netz trainiert' if model.get('training_samples')==signature else 'Neuronales Netz aktiv',
+            'training_samples':signature,'mae_w':round(mae),'next_load_prediction_w':round(next_w) if next_w is not None else None,
+            'model':model['model'],'trained_at':model.get('trained_at'),'architecture':'6 Eingänge · 8 Neuronen · 1 Ausgang',
+            'target':'Hausverbrauch in ca. 10 Sekunden; selbstüberwachtes Prognose-Training'}
+
 # Energy Brain: local, explainable unsupervised load-event learning. No cloud/commands.
 def build_energy_brain(rows):
+    neural=train_load_mlp(rows)
     events=[]; prev=None
     for row in rows[-50000:]:
         try:
@@ -491,7 +559,7 @@ def build_energy_brain(rows):
       'data_gaps_over_30s':len(gaps),'sample_interval_target_seconds':10,
       'status':'Lernphase – Muster werden mit mehr Wiederholungen stabiler',
       'limitations':['Ein Lastsprung ist noch keine sichere Maschinenidentifikation.','Laufzeiten werden erst zuverlässig messbar, wenn Start und Ende im Verlauf erkannt werden.','Bei gleichzeitigen Verbrauchern können sich Laständerungen überlagern.'],
-      'active_control_enabled':False,'commands_sent':False}
+      'neural_network':neural,'active_control_enabled':False,'commands_sent':False}
 
 @app.route('/energy-brain')
 def energy_brain():

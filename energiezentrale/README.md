@@ -1,4 +1,4 @@
-## Version 1.2.15 – Energy Brain
+## Version 1.2.16 – Energy Brain
 - Lokale Lastsprung-Erkennung und Gruppierung ähnlicher Ereignisse; neue Seite `/energy-brain` und API `/api/energy-brain`.
 - Keine Cloud, keine Steuerbefehle; Erkennungen bleiben zunächst unbestätigte Profile.
 
