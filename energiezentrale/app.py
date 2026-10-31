@@ -528,8 +528,11 @@ def build_energy_brain(rows):
                 dt=ts-prev['ts']; delta=load-prev['load']
                 if 5 <= dt <= 35 and abs(delta)>=900:
                     events.append({'ts':ts,'delta':delta,'load':load,'duration_hint':dt,
-                      'grid':float(grid) if grid is not None else None,'battery':float(batt) if batt is not None else None,'pv':float(pv) if pv is not None else None})
-            prev={'ts':ts,'load':load}
+                      'grid':float(grid) if grid is not None else None,'battery':float(batt) if batt is not None else None,'pv':float(pv) if pv is not None else None,
+                      'grid_delta':(float(grid)-float(prev['grid'])) if grid is not None and prev.get('grid') is not None else None,
+                      'battery_delta':(float(batt)-float(prev['battery'])) if batt is not None and prev.get('battery') is not None else None,
+                      'pv_delta':(float(pv)-float(prev['pv'])) if pv is not None and prev.get('pv') is not None else None})
+            prev={'ts':ts,'load':load,'grid':float(grid) if grid is not None else None,'battery':float(batt) if batt is not None else None,'pv':float(pv) if pv is not None else None}
         except (ValueError,TypeError): continue
     # Greedy clustering by direction and step magnitude; transparent tolerance, not a neural model.
     clusters=[]
@@ -552,8 +555,8 @@ def build_energy_brain(rows):
         profiles.append({'id':f'P{i:02d}','direction':c['direction'],'mean_step_w':round(c['mean_w']),
           'events':n,'confidence':confidence,'typical_times':hours[:8],
           'explanation':f'{n} ähnliche {c["direction"].lower()}-Ereignisse; mittlere Änderung etwa {round(c["mean_w"])} W. Verbraucheridentität nicht bekannt.'})
-    # Pair positive load steps with the next plausible negative step of similar size.
-    # This estimates operating-cycle duration; it does not identify the machine.
+    # Pair start/end transitions conservatively. A short maximum window avoids
+    # joining unrelated events hours apart; matching considers all available channels.
     rises=sorted([e for e in events if e['delta']>0], key=lambda e:e['ts'])
     falls=sorted([e for e in events if e['delta']<0], key=lambda e:e['ts'])
     used_falls=set(); cycles=[]
@@ -562,30 +565,48 @@ def build_energy_brain(rows):
         for idx,fall in enumerate(falls):
             if idx in used_falls or fall['ts'] <= rise['ts']: continue
             duration=fall['ts']-rise['ts']
-            if duration > 6*3600: break
+            if duration > 45*60: break
             magnitude=abs(rise['delta']); endmag=abs(fall['delta'])
-            tolerance=max(1800, magnitude*0.25)
-            if abs(magnitude-endmag) <= tolerance:
-                candidates.append((duration,idx,fall))
+            tolerance=max(1200, magnitude*0.20)
+            if abs(magnitude-endmag) > tolerance: continue
+            # Prefer similar grid/battery/PV response where both readings exist.
+            channel_penalty=0.0; compared=0
+            for key in ('grid_delta','battery_delta','pv_delta'):
+                a,b=rise.get(key),fall.get(key)
+                if a is not None and b is not None:
+                    channel_penalty += min(abs(a+b),12000)/12000; compared += 1
+            score=abs(magnitude-endmag)/max(tolerance,1) + duration/(45*60)*0.15 + (channel_penalty/compared if compared else 0)*0.25
+            candidates.append((score,idx,fall,duration))
         if candidates:
-            duration,idx,fall=min(candidates,key=lambda x:x[0])
+            _,idx,fall,duration=min(candidates,key=lambda x:x[0])
             used_falls.add(idx)
-            cycles.append({'start_ts':rise['ts'],'duration_s':duration,'power_w':(abs(rise['delta'])+abs(fall['delta']))/2})
+            cycles.append({'start_ts':rise['ts'],'duration_s':duration,
+                'power_w':(abs(rise['delta'])+abs(fall['delta']))/2,
+                'grid_delta_w':None if rise.get('grid_delta') is None or fall.get('grid_delta') is None else (rise['grid_delta']+fall['grid_delta'])/2,
+                'battery_delta_w':None if rise.get('battery_delta') is None or fall.get('battery_delta') is None else (rise['battery_delta']+fall['battery_delta'])/2,
+                'pv_delta_w':None if rise.get('pv_delta') is None or fall.get('pv_delta') is None else (rise['pv_delta']+fall['pv_delta'])/2})
     cycle_groups=[]
     for cycle in cycles:
         match=None
         for group in cycle_groups:
-            if abs(cycle['power_w']-group['mean_power_w']) <= max(1800,group['mean_power_w']*.25):
+            power_close=abs(cycle['power_w']-group['mean_power_w']) <= max(1200,group['mean_power_w']*.18)
+            duration_close=abs(cycle['duration_s']-group['median_duration_s']) <= max(180,group['median_duration_s']*.60)
+            if power_close and duration_close:
                 match=group; break
         if match is None:
-            match={'mean_power_w':cycle['power_w'],'items':[]}; cycle_groups.append(match)
+            match={'mean_power_w':cycle['power_w'],'median_duration_s':cycle['duration_s'],'items':[]}; cycle_groups.append(match)
         match['items'].append(cycle)
         match['mean_power_w']=sum(x['power_w'] for x in match['items'])/len(match['items'])
+        match['median_duration_s']=statistics.median(x['duration_s'] for x in match['items'])
     learned_cycles=[]
     for i,g in enumerate(sorted(cycle_groups,key=lambda x:len(x['items']),reverse=True)[:10],1):
         items=g['items']; durations=[x['duration_s'] for x in items]
+        def avg_channel(key):
+            vals=[x[key] for x in items if x.get(key) is not None]
+            return round(statistics.median(vals)) if vals else None
         learned_cycles.append({'id':f'Z{i:02d}','cycles':len(items),'mean_power_w':round(g['mean_power_w']),
             'median_duration_s':round(statistics.median(durations)),
+            'grid_response_w':avg_channel('grid_delta_w'),'battery_response_w':avg_channel('battery_delta_w'),'pv_response_w':avg_channel('pv_delta_w'),
             'confidence':'vorläufig' if len(items)<5 else 'mittel' if len(items)<15 else 'hoch',
             'times':[datetime.fromtimestamp(x['start_ts'],timezone.utc).astimezone().strftime('%H:%M') for x in items[:8]]})
     # Coarse data quality summary
@@ -595,12 +616,12 @@ def build_energy_brain(rows):
             ta=datetime.fromisoformat(a['timestamp'].replace('Z','+00:00')).timestamp(); tb=datetime.fromisoformat(b['timestamp'].replace('Z','+00:00')).timestamp();
             if tb-ta>30: gaps.append(tb-ta)
         except Exception: pass
-    return {'engine':'Energy Brain local v1','method':'Lastsprungerkennung + erklärbares Clustering + heuristische Start/Ende-Paarung',
+    return {'engine':'Energy Brain local v2','method':'Lastsprungerkennung + Multi-Kanal-Merkmale + zeitlich begrenzte Start/Ende-Paarung und Dauer-/Leistungs-Clustering',
       'samples_used':min(len(rows),50000),'events_found':len(events),'profiles':profiles,
       'paired_cycles_found':len(cycles),'cycle_profiles':learned_cycles,
       'data_gaps_over_30s':len(gaps),'sample_interval_target_seconds':10,
       'status':'Lernphase – Muster werden mit mehr Wiederholungen stabiler',
-      'limitations':['Ein Lastsprung ist noch keine sichere Maschinenidentifikation.','Laufzeiten werden erst zuverlässig messbar, wenn Start und Ende im Verlauf erkannt werden.','Bei gleichzeitigen Verbrauchern können sich Laständerungen überlagern.'],
+      'limitations':['Ein Lastsprung ist noch keine sichere Maschinenidentifikation.','Zykluslaufzeiten sind heuristische Zuordnungen innerhalb eines 45-Minuten-Fensters; überlagerte Verbraucher können sie weiterhin verfälschen.','Bei gleichzeitigen Verbrauchern können sich Laständerungen überlagern.'],
       'neural_network':neural,'active_control_enabled':False,'commands_sent':False}
 
 @app.route('/energy-brain')
