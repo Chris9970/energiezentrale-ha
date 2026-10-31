@@ -1,3 +1,7 @@
+## Version 1.2.15 – Energy Brain
+- Lokale Lastsprung-Erkennung und Gruppierung ähnlicher Ereignisse; neue Seite `/energy-brain` und API `/api/energy-brain`.
+- Keine Cloud, keine Steuerbefehle; Erkennungen bleiben zunächst unbestätigte Profile.
+
 # Energiezentrale 1.1.3
 
 Read-only Home Assistant energy analysis add-on. Keeps prior overview, simulation, configuration, consumer planning, learning/history, diagnostics and daily energy pages.

@@ -100,7 +100,7 @@ def sampler():
    if HIST.stat().st_size>15000000:
     lines=HIST.read_text().splitlines()[-10000:]; HIST.write_text('\n'.join(lines)+'\n')
   except Exception:pass
-  time.sleep(max(5,int(os.getenv('SAMPLE_INTERVAL_SECONDS','15'))))
+  time.sleep(max(5,int(os.getenv('SAMPLE_INTERVAL_SECONDS','10'))))
 
 
 def build_battery_plan(c, rows, snap=None):
@@ -148,7 +148,7 @@ def build_battery_plan(c, rows, snap=None):
             samples_by_day.setdefault(dt.date().isoformat(), []).append((ts, max(0.0, imp)))
         except Exception:
             continue
-    sample_s = max(5, int(os.getenv('SAMPLE_INTERVAL_SECONDS','15')))
+    sample_s = max(5, int(os.getenv('SAMPLE_INTERVAL_SECONDS','10')))
     for day, points in samples_by_day.items():
         points.sort()
         energy = 0.0
@@ -442,6 +442,66 @@ def learn_load_patterns(rows, days=14, min_power_w=1000, min_days=3):
             'note': 'Aggregate house load; appliance identity is not inferred.'}
 
 
+
+# Energy Brain: local, explainable unsupervised load-event learning. No cloud/commands.
+def build_energy_brain(rows):
+    events=[]; prev=None
+    for row in rows[-50000:]:
+        try:
+            ts=datetime.fromisoformat(row.get('timestamp','').replace('Z','+00:00')).timestamp()
+            vals=row.get('values') or {}; load=float(vals.get('load_power'))
+            grid=vals.get('grid_power'); batt=vals.get('battery_power'); pv=vals.get('pv_power')
+            if prev:
+                dt=ts-prev['ts']; delta=load-prev['load']
+                if 5 <= dt <= 35 and abs(delta)>=900:
+                    events.append({'ts':ts,'delta':delta,'load':load,'duration_hint':dt,
+                      'grid':float(grid) if grid is not None else None,'battery':float(batt) if batt is not None else None,'pv':float(pv) if pv is not None else None})
+            prev={'ts':ts,'load':load}
+        except (ValueError,TypeError): continue
+    # Greedy clustering by direction and step magnitude; transparent tolerance, not a neural model.
+    clusters=[]
+    for e in events:
+        mag=abs(e['delta']); direction='Lastanstieg' if e['delta']>0 else 'Lastabfall'
+        match=None
+        for c in clusters:
+            if c['direction']==direction and abs(mag-c['mean_w']) <= max(1200, c['mean_w']*.22): match=c; break
+        if match is None:
+            match={'direction':direction,'mean_w':mag,'events':[]}; clusters.append(match)
+        match['events'].append(e); match['mean_w']=sum(abs(x['delta']) for x in match['events'])/len(match['events'])
+    profiles=[]
+    for i,c in enumerate(sorted(clusters,key=lambda x:len(x['events']),reverse=True)[:12],1):
+        ev=c['events']; hours=[datetime.fromtimestamp(x['ts'],timezone.utc).astimezone().strftime('%H:%M') for x in ev]
+        mins=[]
+        for x in ev:
+            # event duration cannot be inferred from a single transition; keep explicitly unknown
+            pass
+        n=len(ev); confidence='vorläufig' if n<5 else 'mittel' if n<15 else 'hoch'
+        profiles.append({'id':f'P{i:02d}','direction':c['direction'],'mean_step_w':round(c['mean_w']),
+          'events':n,'confidence':confidence,'typical_times':hours[:8],
+          'explanation':f'{n} ähnliche {c["direction"].lower()}-Ereignisse; mittlere Änderung etwa {round(c["mean_w"])} W. Verbraucheridentität nicht bekannt.'})
+    # Coarse data quality summary
+    gaps=[]
+    for a,b in zip(rows[-50000:],rows[-50000:][1:]):
+        try:
+            ta=datetime.fromisoformat(a['timestamp'].replace('Z','+00:00')).timestamp(); tb=datetime.fromisoformat(b['timestamp'].replace('Z','+00:00')).timestamp();
+            if tb-ta>30: gaps.append(tb-ta)
+        except Exception: pass
+    return {'engine':'Energy Brain local v1','method':'change-point detection + transparent greedy clustering',
+      'samples_used':min(len(rows),50000),'events_found':len(events),'profiles':profiles,
+      'data_gaps_over_30s':len(gaps),'sample_interval_target_seconds':10,
+      'status':'Lernphase – Muster werden mit mehr Wiederholungen stabiler',
+      'limitations':['Ein Lastsprung ist noch keine sichere Maschinenidentifikation.','Laufzeiten werden erst zuverlässig messbar, wenn Start und Ende im Verlauf erkannt werden.','Bei gleichzeitigen Verbrauchern können sich Laständerungen überlagern.'],
+      'active_control_enabled':False,'commands_sent':False}
+
+@app.route('/energy-brain')
+def energy_brain():
+    result=build_energy_brain(learning_rows())
+    return render_template('energy_brain.html',brain=result)
+
+@app.route('/api/energy-brain')
+def api_energy_brain():
+    return jsonify(build_energy_brain(learning_rows()))
+
 @app.route('/api/learned-load-patterns')
 def api_learned_load_patterns():
     rows = learning_rows()
@@ -667,7 +727,7 @@ def api_peak_analysis():
                 else: battery_discharge=None
                 samples.append((ts,max(0.0,imp),battery_discharge))
         except Exception: continue
-    samples.sort(); daily={}; over_count=0; max_gap=max(30,int(os.getenv('SAMPLE_INTERVAL_SECONDS','15'))*2)
+    samples.sort(); daily={}; over_count=0; max_gap=max(30,int(os.getenv('SAMPLE_INTERVAL_SECONDS','10'))*2)
     excess_kwh=peak_import_kwh=0.0; valid_intervals=0; events=[]; active=None
     for i,(ts,w,batt_w) in enumerate(samples):
         day=datetime.fromtimestamp(ts).astimezone().date().isoformat()
@@ -773,7 +833,7 @@ def diagnostics():
             ts=datetime.fromisoformat(row.get('timestamp','').replace('Z','+00:00')).timestamp()
             if ts>=cutoff: recent.append(row)
             days.add(datetime.fromtimestamp(ts).astimezone().date().isoformat())
-            if prev is not None and ts-prev>max(60, int(os.getenv('SAMPLE_INTERVAL_SECONDS','15'))*4): gaps+=1
+            if prev is not None and ts-prev>max(60, int(os.getenv('SAMPLE_INTERVAL_SECONDS','10'))*4): gaps+=1
             prev=ts
         except Exception: pass
     sensors=[]
@@ -968,7 +1028,7 @@ def analysis_page():
         raw=values.get('grid_power')
         over=grid_import_multiplier is not None and isinstance(raw,(int,float)) and grid_import_multiplier*float(raw)>target
         if over:
-            if event_start is None or event_last is None or ts-event_last>max(60,int(os.getenv('SAMPLE_INTERVAL_SECONDS','15'))*4):
+            if event_start is None or event_last is None or ts-event_last>max(60,int(os.getenv('SAMPLE_INTERVAL_SECONDS','10'))*4):
                 if event_start is not None: peak_events.append({'start':event_start,'end':event_last,'max_w':round(event_max),'duration_min':round(max(0,event_last-event_start)/60,1)})
                 event_start=ts; event_max=grid_import_multiplier*float(raw)
             else: event_max=max(event_max,grid_import_multiplier*float(raw))
