@@ -1,4 +1,4 @@
-import os,json,time,threading,statistics
+import os,json,time,threading,statistics,math
 from datetime import datetime,timezone
 from pathlib import Path
 from flask import Flask,render_template,request,redirect,url_for,flash,jsonify
@@ -33,6 +33,80 @@ def learning_rows(limit=100000):
             if ts >= started: rows.append(row)
     except Exception: return []
     return rows
+
+BRAIN_PATTERN_MEMORY = DATA/'brain_pattern_memory.json'
+BRAIN_PATTERN_LOCK = threading.Lock()
+
+def update_brain_pattern_memory(events):
+    """Persist coarse recurring load-step signatures; process each event once."""
+    empty = {'stored_signatures':0,'new_events':0,'top_patterns':[],
+             'status':'Noch keine Muster gespeichert','last_event_ts':None}
+    with BRAIN_PATTERN_LOCK:
+        state = {'schema_version':1,'last_event_ts':0.0,'patterns':{}}
+        if BRAIN_PATTERN_MEMORY.exists():
+            try:
+                loaded = json.loads(BRAIN_PATTERN_MEMORY.read_text())
+                if not isinstance(loaded,dict) or not isinstance(loaded.get('patterns',{}),dict):
+                    raise ValueError('Ungültiges Muster-Gedächtnisformat')
+                state.update(loaded)
+            except Exception as exc:
+                empty['status'] = 'Musterdatei konnte nicht gelesen werden: ' + str(exc)[:120]
+                return empty
+        try:
+            cursor = float(state.get('last_event_ts') or 0.0)
+        except (TypeError,ValueError):
+            cursor = 0.0
+        patterns = state.setdefault('patterns',{})
+        if not isinstance(patterns,dict):
+            empty['status'] = 'Musterdatei enthält ungültige Daten'
+            return empty
+        new_events = 0
+        newest = cursor
+        for event in sorted(events, key=lambda e: float(e.get('ts',0) or 0)):
+            try:
+                ts = float(event.get('ts'))
+                delta = float(event.get('delta'))
+                if not math.isfinite(ts) or not math.isfinite(delta) or ts <= cursor:
+                    continue
+                magnitude = abs(delta)
+                if magnitude < 900:
+                    continue
+                hour = datetime.fromtimestamp(ts).hour
+                bucket_kw = max(1, int(round(magnitude/1000.0)))
+                direction = 'Anstieg' if delta > 0 else 'Abfall'
+                key = f'{direction}|{bucket_kw}|{hour:02d}'
+                item = patterns.get(key)
+                if not isinstance(item,dict):
+                    item = {'direction':direction,'power_bucket_kw':bucket_kw,'hour':hour,
+                            'count':0,'first_seen':ts,'last_seen':ts}
+                    patterns[key] = item
+                item['count'] = int(item.get('count',0)) + 1
+                item['first_seen'] = min(float(item.get('first_seen',ts)),ts)
+                item['last_seen'] = max(float(item.get('last_seen',ts)),ts)
+                newest = max(newest,ts)
+                new_events += 1
+            except (TypeError,ValueError,OverflowError,OSError):
+                continue
+        # Bound storage while retaining the most frequently observed signatures.
+        if len(patterns) > 200:
+            keep = sorted(patterns.items(),key=lambda kv:int((kv[1] or {}).get('count',0)),reverse=True)[:200]
+            patterns = dict(keep)
+            state['patterns'] = patterns
+        state['schema_version'] = 1
+        state['last_event_ts'] = newest
+        try:
+            tmp = BRAIN_PATTERN_MEMORY.with_suffix('.tmp')
+            tmp.write_text(json.dumps(state,ensure_ascii=False,separators=(',',':')))
+            tmp.replace(BRAIN_PATTERN_MEMORY)
+        except Exception as exc:
+            empty['status'] = 'Muster konnten nicht dauerhaft gespeichert werden: ' + str(exc)[:120]
+            return empty
+        top = sorted(patterns.values(),key=lambda x:int(x.get('count',0)),reverse=True)[:8]
+        return {'stored_signatures':len(patterns),'new_events':new_events,
+                'top_patterns':top,'status':'Dauerhaft gespeichert' if patterns else 'Noch keine Muster gespeichert',
+                'last_event_ts':newest or None}
+
+
 DEFAULT={'plant_name':'Meine Energiezentrale','sensors':{
 'pv_power':{'label':'PV-Leistung','entity_id':'sensor.sofar_speicher_pv_power_total','unit':'W'},
 'load_power':{'label':'Hausverbrauch','entity_id':'sensor.sofar_speicher_active_power_load_sys','unit':'W'},
@@ -598,6 +672,7 @@ def build_energy_brain(rows):
                       'pv_delta':(float(pv)-float(prev['pv'])) if pv is not None and prev.get('pv') is not None else None})
             prev={'ts':ts,'load':load,'grid':float(grid) if grid is not None else None,'battery':float(batt) if batt is not None else None,'pv':float(pv) if pv is not None else None}
         except (ValueError,TypeError): continue
+    pattern_memory = update_brain_pattern_memory(events)
     # Greedy clustering by direction and step magnitude; transparent tolerance, not a neural model.
     clusters=[]
     for e in events:
@@ -707,6 +782,7 @@ def build_energy_brain(rows):
     return {'engine':'Energy Brain local v3','method':'Anlagenweite Musteranalyse aus Hauslast, Netz, Batterie und PV; Lastsprünge und Zyklusprofile sind erklärbare statistische Merkmale. Das neuronale Netz prognostiziert den aggregierten Hausverbrauch. Geräteidentitäten sind ausdrücklich nicht erforderlich.',
       'samples_used':min(len(rows),50000),'events_found':len(events),'profiles':profiles,
       'paired_cycles_found':len(cycles),'cycle_profiles':learned_cycles,
+      'persistent_pattern_memory':pattern_memory,
       'data_gaps_over_30s':len(gaps),'sample_interval_target_seconds':10,
       'status':'Lernphase – Muster werden mit mehr Wiederholungen stabiler',
       'energy_balance':{'formula':'PV − Batterie − Netz − Hauslast','valid_samples':balance_valid,
