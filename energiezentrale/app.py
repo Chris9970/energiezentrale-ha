@@ -1,5 +1,5 @@
 import os,json,time,threading,statistics,math
-from datetime import datetime,timezone
+from datetime import datetime,timezone,timedelta
 from pathlib import Path
 from flask import Flask,render_template,request,redirect,url_for,flash,jsonify
 import requests
@@ -198,6 +198,54 @@ def sampler():
   time.sleep(max(5,int(os.getenv('SAMPLE_INTERVAL_SECONDS','10'))))
 
 
+def learn_morning_energy_need(daily_excess_kwh, daily_peak_w):
+    """Walk-forward shadow forecast: next morning resembles recent mornings.
+    Uses only complete days and is accepted only if it beats yesterday-as-baseline.
+    """
+    days=sorted(set(daily_excess_kwh)&set(daily_peak_w))
+    pairs=[]
+    for day in days:
+        previous=(datetime.fromisoformat(day).date()-timedelta(days=1)).isoformat()
+        if previous in daily_excess_kwh and previous in daily_peak_w:
+            pairs.append(([1.0,float(daily_excess_kwh[previous]),float(daily_peak_w[previous])/10000.0],
+                          float(daily_excess_kwh[day])))
+    if len(pairs)<12:
+        return {'status':'Lernt noch','trained':False,'days':len(days),'pairs':len(pairs),
+                'prediction_kwh':None,'mae_kwh':None,'baseline_mae_kwh':None,'beats_baseline':False}
+    holdout=max(3,int(len(pairs)*0.2)); train=pairs[:-holdout]; check=pairs[-holdout:]
+    # Ridge regression solved with small Gauss-Jordan elimination; no ML package required.
+    n=3; matrix=[[0.0]*(n+1) for _ in range(n)]
+    for x,y in train:
+        for i in range(n):
+            for j in range(n): matrix[i][j]+=x[i]*x[j]
+            matrix[i][n]+=x[i]*y
+    matrix[1][1]+=0.15; matrix[2][2]+=0.15
+    try:
+        for col in range(n):
+            pivot=max(range(col,n),key=lambda r:abs(matrix[r][col]))
+            if abs(matrix[pivot][col])<1e-9: raise ValueError('singular')
+            matrix[col],matrix[pivot]=matrix[pivot],matrix[col]
+            scale=matrix[col][col]; matrix[col]=[v/scale for v in matrix[col]]
+            for row in range(n):
+                if row==col: continue
+                factor=matrix[row][col]
+                matrix[row]=[matrix[row][j]-factor*matrix[col][j] for j in range(n+1)]
+        weights=[matrix[i][n] for i in range(n)]
+    except (ValueError,ZeroDivisionError):
+        return {'status':'Zu wenig unabhängige Daten','trained':False,'days':len(days),'pairs':len(pairs),
+                'prediction_kwh':None,'mae_kwh':None,'baseline_mae_kwh':None,'beats_baseline':False}
+    predict=lambda x:max(0.0,sum(a*b for a,b in zip(weights,x)))
+    model_mae=sum(abs(predict(x)-y) for x,y in check)/len(check)
+    baseline_mae=sum(abs(x[1]-y) for x,y in check)/len(check)
+    latest_day=days[-1]
+    latest_x=[1.0,float(daily_excess_kwh[latest_day]),float(daily_peak_w[latest_day])/10000.0]
+    beats=model_mae+0.03<baseline_mae
+    return {'status':'Aktiv · besser als Vortag' if beats else 'Schattenmodell · derzeit nicht besser',
+            'trained':True,'days':len(days),'pairs':len(pairs),
+            'prediction_kwh':round(predict(latest_x),2) if beats else None,
+            'mae_kwh':round(model_mae,2),'baseline_mae_kwh':round(baseline_mae,2),
+            'beats_baseline':beats,'holdout_days':len(check)}
+
 def build_battery_plan(c, rows, snap=None):
     """Advisory battery plan from measured morning peaks and configured PV forecast.
     No inverter/consumer commands are sent by this function."""
@@ -315,15 +363,25 @@ def build_battery_plan(c, rows, snap=None):
     # morning load as a provisional reserve signal, and only with >=3 valid
     # morning grid-history days. Existing measured excess remains authoritative.
     learned_reserve_signal_kwh = learned_morning_load_kwh * 0.5 if enough and morning_patterns else 0.0
-    reserve_addition_kwh = max(excess_median or 0.0, learned_reserve_signal_kwh) if enough else None
-    required_kwh = max(reserve_kwh or 0.0, (reserve_kwh or 0.0) + reserve_addition_kwh) if enough else None
+    strategy = learn_morning_energy_need(daily_excess_kwh, daily_peak_w)
+    strategy_need_kwh = strategy.get('prediction_kwh') if strategy.get('beats_baseline') else None
+    reserve_addition_kwh = max(excess_median or 0.0, learned_reserve_signal_kwh,
+                               strategy_need_kwh or 0.0) if enough else None
+    required_kwh = min(capacity_kwh, max(reserve_kwh or 0.0, (reserve_kwh or 0.0) + reserve_addition_kwh)) if enough and capacity_kwh else None
     target_soc = min(100.0, required_kwh/capacity_kwh*100.0) if required_kwh is not None and capacity_kwh else None
+    charge_efficiency = max(0.5, min(1.0, float(st.get('battery_roundtrip_efficiency', 0.90) or 0.90)))
+    estimated_grid_charge_kwh = (max(0.0, required_kwh-current_kwh)/charge_efficiency
+                                 if required_kwh is not None and current_kwh is not None else None)
     advice = []
     if not enough:
         advice.append(f'Für belastbare Batterieplanung werden mindestens drei Morgen mit genügend Messpunkten und mindestens {int(min_coverage_seconds/60)} Minuten zeitlicher Abdeckung benötigt; gültig: {len(valid_days)}, verworfen: {len(set(samples_by_day)-valid_days)}.')
     else:
         advice.append(f'Median der morgendlichen Netzbezugs-Spitzen: {peak_median:.0f} W.')
         advice.append(f'Geschätzte tägliche Energie oberhalb des weichen {target_w:.0f}-W-Ziels: {excess_median:.2f} kWh.')
+        if strategy.get('beats_baseline'):
+            advice.append(f'Das lernende Schattenmodell erwartet für den nächsten Morgen etwa {strategy_need_kwh:.2f} kWh oberhalb des Netzbezugsziels. Die Schätzung wird nur übernommen, wenn sie im zeitlichen Rücktest besser war als „wie gestern“; niedrigere Werte senken die Reserve nicht unter den historischen Median.')
+        else:
+            advice.append(f'Schattenmodell: {strategy.get("status")} (Prüffehler {strategy.get("mae_kwh", "–")} kWh gegenüber {strategy.get("baseline_mae_kwh", "–")} kWh beim Vortagsvergleich). Die bisherige Median-Schätzung bleibt maßgeblich.')
         if morning_patterns:
             advice.append(f'Gelernte wiederkehrende Morgenlast: ca. {learned_morning_load_kwh:.2f} kWh in {len(morning_patterns)} erkannten 15-Minuten-Zeitfenstern; Vertrauensstufe: {learned_morning_confidence}.')
             advice.append('Die gelernte Last beeinflusst die Reserve nur vorsichtig (höchstens 50 % als Zusatzsignal), da PV-Erzeugung und Netz-/Batterieanteile nicht für jede Last sicher getrennt werden können.')
@@ -349,12 +407,14 @@ def build_battery_plan(c, rows, snap=None):
         'learned_morning_load_estimate_kwh':round(learned_morning_load_kwh, 3),
         'learned_morning_confidence':learned_morning_confidence,
         'learned_reserve_signal_kwh':round(learned_reserve_signal_kwh, 3),
+        'learned_strategy':strategy,
         'recommended_morning_reserve_kwh':required_kwh,'recommended_morning_soc_percent':target_soc,
+        'estimated_grid_charge_kwh_to_target':round(estimated_grid_charge_kwh,2) if estimated_grid_charge_kwh is not None else None,
         'pv_forecast_kwh':pv_kwh,'advice':advice}
 
 @app.route('/')
 def index():
- c=config(); s=snapshot(); _,err=states(); return render_template('index.html',cfg=c,snap=s,ha_error=err,control_runtime=dict(CONTROL_RUNTIME))
+ c=config(); s=snapshot(); return render_template('index.html',cfg=c,snap=s,ha_error=s.get('ha_error'),control_runtime=dict(CONTROL_RUNTIME))
 @app.route('/simulation')
 def simulation():
  c=config(); snap=snapshot(); vals={k:((v or {}).get('value')) for k,v in snap.get('values',{}).items()}
@@ -372,6 +432,19 @@ def simulation():
 
 @app.route('/api/snapshot')
 def api_snapshot():return jsonify(snapshot())
+@app.route('/api/dashboard-history')
+def api_dashboard_history():
+    """Small recent sample window for the live dashboard chart."""
+    rows=[]
+    if HIST.exists():
+        try:
+            for line in HIST.read_text().splitlines()[-360:]:
+                if not line.strip(): continue
+                row=json.loads(line)
+                rows.append({'timestamp':row.get('timestamp'),'values':row.get('values',{})})
+        except Exception:
+            rows=[]
+    return jsonify({'samples':rows,'sample_interval_seconds':max(5,int(os.getenv('SAMPLE_INTERVAL_SECONDS','10')))})
 @app.route('/config',methods=['GET','POST'])
 def config_page():
  c=config(); entities,err=states()
@@ -740,6 +813,7 @@ def learn_load_patterns(rows, days=14, min_power_w=1000, min_days=3):
 BRAIN_MODEL = DATA / 'brain_mlp_model.json'
 BRAIN_TRAIN_LOCK=threading.Lock()
 MODEL_RETRAIN_BATCH=300
+MORNING_STRATEGY_STATE=DATA/'morning_strategy_state.json'
 
 def _sigmoid_tanh(x):
     x=max(-20.0,min(20.0,x))
@@ -1092,6 +1166,19 @@ def model_learning_loop():
             with BRAIN_TRAIN_LOCK:
                 load_model=train_load_mlp(rows)
                 channel_models=train_multichannel_mlp(rows)
+            if rows:
+                latest_values=rows[-1].get('values',{})
+                plan_snapshot={'values':{k:{'value':v,'unit':'Wh' if k=='pv_forecast' else '%' if k=='battery_soc' else 'W'}
+                                         for k,v in latest_values.items()}}
+                strategy=build_battery_plan(config(),rows,plan_snapshot).get('learned_strategy',{})
+                old_state={}
+                try: old_state=json.loads(MORNING_STRATEGY_STATE.read_text())
+                except Exception: pass
+                tmp=MORNING_STRATEGY_STATE.with_suffix('.tmp')
+                tmp.write_text(json.dumps({'updated_at':datetime.now(timezone.utc).isoformat(),**strategy},ensure_ascii=False))
+                tmp.replace(MORNING_STRATEGY_STATE)
+                if strategy.get('status')!=old_state.get('status'):
+                    app.logger.info('Morgen-Schattenstrategie aktualisiert: %s (%s Morgenpaare).',strategy.get('status'),strategy.get('pairs',0))
             if load_model.get('status')=='Neu trainiert' or any(
                     str(c.get('status','')).startswith('Neu trainiert')
                     for c in channel_models.get('channels',[])):
