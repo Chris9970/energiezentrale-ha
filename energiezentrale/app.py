@@ -123,6 +123,10 @@ def config():
   c=json.loads(CFG.read_text()); c.setdefault('plant_name',DEFAULT['plant_name']); c.setdefault('sensors',{})
   for k,v in DEFAULT['sensors'].items(): c['sensors'].setdefault(k,v)
   c.setdefault('consumers',DEFAULT['consumers']); c.setdefault('settings',{}); c.setdefault('control_entities',DEFAULT['control_entities'])
+  c['control_entities'].setdefault('passive_timeout','select.sofar_speicher_inverter_passive_timeout')
+  c['control_entities'].setdefault('passive_timeout_action','select.sofar_speicher_inverter_passive_timeout_action')
+  c['control_entities'].setdefault('timeout_apply_button','button.sofar_speicher_inverter_passive_update_timeout')
+  c['settings'].setdefault('control_margin_w',300); c['settings'].setdefault('battery_charge_power_kw',30)
   for k,v in DEFAULT['settings'].items(): c['settings'].setdefault(k,v)
   # Migrate the known mistaken 30 kW grid-import target to the intended soft target of 5 kW.
   # This affects only the advisory setting; no device commands are sent.
@@ -140,6 +144,13 @@ def ha(path):
  try:
   r=requests.get('http://supervisor/core/api/'+path.lstrip('/'),headers={'Authorization':'Bearer '+token},timeout=8);r.raise_for_status();return r.json(),None
  except Exception as e:return None,str(e)
+def ha_service(domain,service,data):
+ token=os.getenv('SUPERVISOR_TOKEN')
+ if not token:return False,'Supervisor-Token fehlt.'
+ try:
+  r=requests.post(f'http://supervisor/core/api/services/{domain}/{service}',headers={'Authorization':'Bearer '+token,'Content-Type':'application/json'},json=data,timeout=8);r.raise_for_status();return True,None
+ except Exception as e:return False,str(e)
+
 def states():
  data,err=ha('states')
  if err:return [],err
@@ -333,7 +344,7 @@ def build_battery_plan(c, rows, snap=None):
 
 @app.route('/')
 def index():
- c=config(); s=snapshot(); _,err=states(); return render_template('index.html',cfg=c,snap=s,ha_error=err)
+ c=config(); s=snapshot(); _,err=states(); return render_template('index.html',cfg=c,snap=s,ha_error=err,control_runtime=dict(CONTROL_RUNTIME))
 @app.route('/simulation')
 def simulation():
  c=config(); snap=snapshot(); vals={k:((v or {}).get('value')) for k,v in snap.get('values',{}).items()}
@@ -355,6 +366,14 @@ def api_snapshot():return jsonify(snapshot())
 def config_page():
  c=config(); entities,err=states()
  if request.method=='POST':
+  if c.get('settings',{}).get('control_enabled') or ('CONTROL_STATE_FILE' in globals() and CONTROL_STATE_FILE.exists()):
+   changed=[k for k,v in c.get('control_entities',{}).items() if request.form.get('control_'+k,'').strip() and request.form.get('control_'+k,'').strip()!=v]
+   changed += ['sensor_'+k for k,v in c.get('sensors',{}).items() if request.form.get('sensor_'+k,'').strip() and request.form.get('sensor_'+k,'').strip()!=v.get('entity_id','')]
+   if request.form.get('grid_import_sign',c.get('settings',{}).get('grid_import_sign'))!=c.get('settings',{}).get('grid_import_sign'):
+    changed.append('grid_import_sign')
+   if changed:
+    flash('Steuer-Entitäten erst ändern, nachdem die Regelung ausgeschaltet und die Rückschaltung bestätigt wurde.','error')
+    return render_template('config.html',cfg=c,states=entities,ha_error=err)
   c['plant_name']=request.form.get('plant_name','Meine Energiezentrale').strip() or 'Meine Energiezentrale'
   for k,v in c['sensors'].items():
    val=request.form.get('sensor_'+k,'').strip()
@@ -365,11 +384,13 @@ def config_page():
   try:
    c['settings']['grid_import_limit_w']=max(0,int(request.form.get('grid_import_limit_w','5000')))
    c['settings']['battery_reserve_percent']=max(0,min(100,int(request.form.get('battery_reserve_percent','25'))))
-   c['settings']['inverter_count']=max(1,min(10,int(request.form.get('inverter_count','2'))))
+   c['settings']['inverter_count']=max(1,min(2,int(request.form.get('inverter_count','2'))))
    c['settings']['battery_capacity_kwh']=max(1,min(500,int(request.form.get('battery_capacity_kwh','80'))))
    c['settings']['battery_discharge_power_kw']=max(1,min(100,int(request.form.get('battery_discharge_power_kw','30'))))
-   c['settings']['control_enabled']=False
-   c['settings']['mode']='observe'
+   c['settings']['control_margin_w']=max(100,min(3000,int(request.form.get('control_margin_w','300'))))
+   c['settings']['battery_charge_power_kw']=max(1,min(100,int(request.form.get('battery_charge_power_kw','30'))))
+   c['settings']['control_enabled']=(request.form.get('control_enabled')=='on')
+   c['settings']['mode']='passive' if c['settings']['control_enabled'] else 'observe'
    c['settings']['morning_start_hour']=max(0,min(23,int(request.form.get('morning_start_hour','5'))))
    c['settings']['morning_end_hour']=max(1,min(24,int(request.form.get('morning_end_hour','9'))))
    c['settings']['grid_import_sign']=request.form.get('grid_import_sign','unverified') if request.form.get('grid_import_sign','unverified') in ('positive','negative','unverified') else 'unverified'
@@ -392,8 +413,191 @@ def config_page():
    c['settings']['balance_alert_pct']=max(1,min(100,float(request.form.get('balance_alert_pct','15'))))
    c['settings']['pv_forecast_mode']=request.form.get('pv_forecast_mode','daily_total') if request.form.get('pv_forecast_mode','daily_total') in ('daily_total','remaining') else 'daily_total'
   except ValueError:flash('Grenzwerte müssen Zahlen sein.','error');return render_template('config.html',cfg=c,states=entities,ha_error=err)
-  save(c);flash('Konfiguration gespeichert. Es wurden keine Geräte geschaltet.','success');entities,err=states();return render_template('config.html',cfg=c,states=entities,ha_error=err)
+  save(c);flash('Konfiguration gespeichert. Die Steuerung wird nur bei bestandener Sicherheitsprüfung freigegeben.' if c['settings']['control_enabled'] else 'Konfiguration gespeichert. Steuerung bleibt ausgeschaltet.','success');entities,err=states();return render_template('config.html',cfg=c,states=entities,ha_error=err)
  return render_template('config.html',cfg=c,states=entities,ha_error=err)
+
+CONTROL_STATE_FILE=DATA/'control_state.json'
+CONTROL_RUNTIME={'status':'Steuerung aus','ready':False,'active':False,'last_update':None,'reasons':[],'recommendation':None}
+CONTROL_LOCK=threading.Lock()
+
+def control_preflight(c=None):
+    c=c or config(); st=c.get('settings',{}); ce=c.get('control_entities',{})
+    reasons=[]; data,err=ha('states')
+    if err or not isinstance(data,list):
+        return {'ready':False,'reasons':['Home Assistant nicht erreichbar: '+str(err or 'keine Zustandsliste')],'entities':{},'sensors':{}}
+    entities={item.get('entity_id'):item for item in data if isinstance(item,dict)}
+    required=('mode','grid_setpoint','charge_power','discharge_power','apply_button','passive_timeout','passive_timeout_action','timeout_apply_button')
+    selected={}
+    for key in required:
+        eid=ce.get(key,''); item=entities.get(eid)
+        selected[key]=item
+        if not item or item.get('state') in ('unknown','unavailable','None'):
+            reasons.append(f'Steuerungs-Entität {key} fehlt oder ist nicht verfügbar ({eid or "nicht konfiguriert"}).')
+    if st.get('grid_import_sign') not in ('positive','negative'):
+        reasons.append('Vorzeichen des Netzleistungssensors ist nicht bestätigt.')
+    if int(st.get('inverter_count',1) or 1) not in (1,2):
+        reasons.append('Aktive Regelung unterstützt derzeit höchstens zwei parallel arbeitende Wechselrichter.')
+    sensor_values={}
+    for key in ('pv_power','load_power','grid_power','battery_soc'):
+        eid=c.get('sensors',{}).get(key,{}).get('entity_id',''); item=entities.get(eid)
+        if not item:
+            reasons.append(f'Sensor {key} fehlt ({eid or "nicht konfiguriert"}).'); continue
+        try:
+            value=float(item.get('state'))
+            if not math.isfinite(value): raise ValueError()
+            if (key=='battery_soc' and not 0<=value<=100) or (key in ('pv_power','load_power') and not 0<=value<=250000) or (key=='grid_power' and abs(value)>250000): raise ValueError('Wert außerhalb des zulässigen Bereichs')
+            updated=datetime.fromisoformat(item.get('last_updated','').replace('Z','+00:00')).timestamp()
+            if time.time()-updated>180: raise ValueError('veraltet')
+            unit=str((item.get('attributes') or {}).get('unit_of_measurement','')).lower()
+            if key=='battery_soc' and unit not in ('%','percent'): raise ValueError('Einheit muss % sein')
+            if key!='battery_soc' and unit not in ('w','watt'): raise ValueError('Einheit muss W sein')
+            sensor_values[key]=value
+        except (TypeError,ValueError,OverflowError):
+            reasons.append(f'Sensor {key} ist ungültig, älter als 180 Sekunden oder hat keine erwartete Einheit.')
+    mode=selected.get('mode') or {}; mode_options=(mode.get('attributes') or {}).get('options',[])
+    if not any('passive' in str(x).casefold() for x in mode_options): reasons.append('Betriebsmodus-Entität bietet keine Auswahl „Passive Mode“.')
+    timeout=selected.get('passive_timeout') or {}; timeout_options=(timeout.get('attributes') or {}).get('options',[])
+    if not any('5 minute' in str(x).casefold() for x in timeout_options): reasons.append('Passivmodus-Watchdog bietet keine 5-Minuten-Einstellung.')
+    action=selected.get('passive_timeout_action') or {}; action_options=(action.get('attributes') or {}).get('options',[])
+    if not any('previous' in str(x).casefold() for x in action_options): reasons.append('Watchdog bietet keine Aktion „Return to Previous Mode“.')
+    watchdog_armed=(str(timeout.get('state','')).casefold()=='5 minutes' and 'previous' in str(action.get('state','')).casefold())
+    number_specs=(('grid_setpoint',0,0),('charge_power',0,1),('discharge_power',-1,0))
+    for key,need_min,need_max in number_specs:
+        item=selected.get(key) or {}; attrs=item.get('attributes') or {}
+        try:
+            lo=float(attrs.get('min',attrs.get('min_value',attrs.get('native_min_value'))))
+            hi=float(attrs.get('max',attrs.get('max_value',attrs.get('native_max_value'))))
+            if lo>need_min or hi<need_max: reasons.append(f'Sollwertbereich von {key} unterstützt die benötigten Sicherheitswerte nicht.')
+        except (TypeError,ValueError): reasons.append(f'Sollwertgrenzen von {key} sind nicht lesbar.')
+    return {'ready':not reasons,'reasons':reasons,'entities':selected,'sensors':sensor_values,'ha_states':entities,'watchdog_armed':watchdog_armed}
+
+def _control_call(domain,service,eid,extra=None):
+    payload={'entity_id':eid}; payload.update(extra or {})
+    ok,error=ha_service(domain,service,payload)
+    if not ok: raise RuntimeError(f'{domain}.{service} für {eid}: {error}')
+
+def _arm_passive_watchdog(c,pre):
+    ce=c['control_entities']; states=pre['ha_states']
+    timeout=states.get(ce['passive_timeout'],{}); action=states.get(ce['passive_timeout_action'],{})
+    if str(timeout.get('state','')).casefold()!='5 minutes':
+        _control_call('select','select_option',ce['passive_timeout'],{'option':'5 Minutes'})
+    if 'previous' not in str(action.get('state','')).casefold():
+        option=next((str(x) for x in (action.get('attributes') or {}).get('options',[]) if 'previous' in str(x).casefold()),None)
+        if not option: raise RuntimeError('Watchdog-Aktion „Return to Previous Mode“ fehlt.')
+        _control_call('select','select_option',ce['passive_timeout_action'],{'option':option})
+    _control_call('button','press',ce['timeout_apply_button'])
+    time.sleep(2)
+    check=control_preflight(c)
+    confirmed_timeout=check['ha_states'].get(ce['passive_timeout'],{}).get('state','')
+    confirmed_action=check['ha_states'].get(ce['passive_timeout_action'],{}).get('state','')
+    if str(confirmed_timeout).casefold()!='5 minutes' or 'previous' not in str(confirmed_action).casefold():
+        raise RuntimeError('Der 5-Minuten-Watchdog mit Rückkehr zum vorherigen Modus wurde vom Wechselrichter nicht bestätigt.')
+    if not check['ready']:
+        # Only the selected timeout state may be in flight; every other failure blocks arming.
+        bad=[x for x in check['reasons'] if 'SoC-Reserve' not in x]
+        if bad: raise RuntimeError('; '.join(bad))
+
+def _write_passive_targets(c,pre):
+    st=c['settings']; ce=c['control_entities']; sensors=pre['sensors']; states=pre['ha_states']
+    raw_grid=sensors['grid_power']; sign=st['grid_import_sign']
+    export_w=max(0.0,raw_grid) if sign=='negative' else max(0.0,-raw_grid)
+    margin=float(st.get('control_margin_w',300))
+    number_attrs=(states.get(ce['charge_power'],{}).get('attributes') or {})
+    charge_hw_max=float(number_attrs.get('max',number_attrs.get('max_value',number_attrs.get('native_max_value',0))))
+    inverter_count=max(1,int(st.get('inverter_count',1) or 1))
+    # The configured master/passive setpoint is applied by the parallel
+    # master/slave pair to each inverter, so convert plant totals to per-unit W.
+    charge_cap=min(float(st.get('battery_charge_power_kw',30))*1000/inverter_count,
+                    charge_hw_max,max(0.0,export_w-margin)/inverter_count)
+    discharge_attrs=(states.get(ce['discharge_power'],{}).get('attributes') or {})
+    discharge_hw_min=abs(float(discharge_attrs.get('min',discharge_attrs.get('min_value',discharge_attrs.get('native_min_value',0)))))
+    reserve=float(st.get('battery_reserve_percent',25)); soc=sensors['battery_soc']
+    discharge_cap=min(float(st.get('battery_discharge_power_kw',30))*1000/inverter_count,discharge_hw_min) if soc>reserve else 0
+    # Passive mode uses positive battery watts for charging and negative for discharge.
+    _control_call('number','set_value',ce['grid_setpoint'],{'value':0})
+    _control_call('number','set_value',ce['charge_power'],{'value':int(charge_cap//100*100)})
+    _control_call('number','set_value',ce['discharge_power'],{'value':-int(discharge_cap//100*100)})
+    _control_call('button','press',ce['apply_button'])
+    return {'charge_power_per_inverter_w':int(charge_cap//100*100),
+            'discharge_power_limit_per_inverter_w':-int(discharge_cap//100*100)}
+
+def _restore_control_mode():
+    try: previous=json.loads(CONTROL_STATE_FILE.read_text()).get('previous_mode')
+    except Exception: previous=None
+    c=config(); eid=c.get('control_entities',{}).get('mode','')
+    if previous and eid:
+        _control_call('select','select_option',eid,{'option':previous})
+        time.sleep(1)
+        restored,_=ha('states/'+eid)
+        if not isinstance(restored,dict) or str(restored.get('state','')).casefold()!=str(previous).casefold():
+            raise RuntimeError('Vorheriger Speichermodus wurde nicht bestätigt; der Wechselrichter-Watchdog bleibt als Rückfallebene aktiv.')
+    try: CONTROL_STATE_FILE.unlink(missing_ok=True)
+    except Exception: pass
+
+def control_tick():
+    c=config(); enabled=bool(c.get('settings',{}).get('control_enabled',False))
+    with CONTROL_LOCK:
+        previous_state={}
+        try: previous_state=json.loads(CONTROL_STATE_FILE.read_text())
+        except Exception: pass
+        if not enabled:
+            if previous_state.get('active'):
+                try: _restore_control_mode(); CONTROL_RUNTIME.update(active=False,status='Steuerung ausgeschaltet · vorheriger Modus wiederhergestellt',ready=False,reasons=[])
+                except Exception as exc: CONTROL_RUNTIME.update(active=True,status='Rückschaltung fehlgeschlagen',ready=False,reasons=[str(exc)])
+            else: CONTROL_RUNTIME.update(active=False,ready=False,status='Steuerung aus',reasons=[])
+            return
+        pre=control_preflight(c)
+        if previous_state.get('active') and not pre.get('watchdog_armed'):
+            pre['ready']=False; pre['reasons'].append('Der aktive Regler hat keinen bestätigten 5-Minuten-Watchdog mit Rückkehr zum vorherigen Modus.')
+        if not pre['ready']:
+            restore_failed=False
+            if previous_state.get('active'):
+                try: _restore_control_mode(); c['settings']['control_enabled']=False; c['settings']['mode']='observe'; save(c)
+                except Exception as exc: restore_failed=True; pre['reasons'].append('Rückschaltung fehlgeschlagen: '+str(exc))
+            CONTROL_RUNTIME.update(active=restore_failed,ready=False,status='Sicherheitsprüfung nicht bestanden'+(' · Watchdog-Rückfall aktiv' if restore_failed else ''),reasons=pre['reasons'])
+            return
+        sign=c['settings']['grid_import_sign']; raw_grid=pre['sensors']['grid_power']
+        export_w=max(0.0,raw_grid) if sign=='negative' else max(0.0,-raw_grid)
+        try:
+            if not previous_state.get('active'):
+                mode_item=pre['entities']['mode']; current=mode_item.get('state')
+                if 'passive' in str(current).casefold(): raise RuntimeError('Wechselrichter ist bereits im Passivmodus; vorherigen Modus zuerst manuell prüfen.')
+                previous_state={'previous_mode':current,'active':True}
+                tmp=CONTROL_STATE_FILE.with_suffix('.tmp'); tmp.write_text(json.dumps(previous_state)); tmp.replace(CONTROL_STATE_FILE)
+                _arm_passive_watchdog(c,pre)
+                pre=control_preflight(c)
+                if not pre['ready'] or not pre.get('watchdog_armed'): raise RuntimeError('; '.join(pre['reasons']) or 'Watchdog nicht bestätigt.')
+            last=float(previous_state.get('last_apply',0) or 0)
+            targets=CONTROL_RUNTIME.get('recommendation') or {}
+            if not targets or time.time()-last>=25:
+                targets=_write_passive_targets(c,pre)
+                mode_options=(pre['entities']['mode'].get('attributes') or {}).get('options',[])
+                passive=next(str(x) for x in mode_options if 'passive' in str(x).casefold())
+                if str(pre['entities']['mode'].get('state','')).casefold()!=passive.casefold():
+                    _control_call('select','select_option',c['control_entities']['mode'],{'option':passive})
+                previous_state['last_apply']=time.time(); tmp=CONTROL_STATE_FILE.with_suffix('.tmp'); tmp.write_text(json.dumps(previous_state)); tmp.replace(CONTROL_STATE_FILE)
+            per_limit=targets.get('discharge_power_limit_per_inverter_w')
+            CONTROL_RUNTIME.update(active=True,ready=True,status=f'Aktiv · {int(c["settings"].get("inverter_count",1))} Wechselrichter · Entladegrenze {per_limit} W je Gerät · Watchdog aktiv',reasons=[],last_update=datetime.now(timezone.utc).isoformat(),recommendation={**targets,'target_grid_w_per_inverter':0,'pv_export_w_total':round(export_w),'battery_soc_percent':pre['sensors']['battery_soc']})
+        except Exception as exc:
+            restore_failed=False
+            try: _restore_control_mode()
+            except Exception as restore_exc: restore_failed=True; CONTROL_RUNTIME['reasons']=['Steuerfehler: '+str(exc),'Rückschaltung fehlgeschlagen: '+str(restore_exc)]
+            c['settings']['control_enabled']=False; c['settings']['mode']='observe'; save(c)
+            CONTROL_RUNTIME.update(active=restore_failed,ready=False,status='Automatisch gesperrt · Steuerfehler'+(' · Watchdog-Rückfall aktiv' if restore_failed else ''),reasons=CONTROL_RUNTIME.get('reasons') or [str(exc)])
+
+def controller_loop():
+    while True:
+        try: control_tick()
+        except Exception as exc: app.logger.exception('Speicherregler-Fehler'); CONTROL_RUNTIME.update(status='Reglerfehler',ready=False,reasons=[str(exc)])
+        time.sleep(10)
+
+@app.route('/api/control/status')
+def api_control_status():
+    c=config(); check=control_preflight(c)
+    return jsonify({'enabled':bool(c.get('settings',{}).get('control_enabled',False)),
+        'preflight_ready':check['ready'],'preflight_reasons':check['reasons'],
+        'runtime':dict(CONTROL_RUNTIME),'mode':'active_control' if CONTROL_RUNTIME.get('active') else 'advisory_only',
+        'commands_sent':bool(CONTROL_RUNTIME.get('active'))})
 @app.route('/consumers',methods=['GET','POST'])
 def consumers():
  c=config()
@@ -779,6 +983,50 @@ def build_energy_brain(rows):
     balance_status = ('Zu wenige gemeinsame Messwerte' if balance_valid < 30 else
                       'Plausibel' if balance_median is not None and balance_median <= 1500 else
                       'Abweichung prüfen')
+    # The Energy Brain template displays this field. Keep the calculation
+    # defensive so an empty or malformed history still renders the page.
+    hourly_counts={}
+    for row in rows[-50000:]:
+        try:
+            ts=datetime.fromisoformat(row.get('timestamp','').replace('Z','+00:00')).timestamp()
+            hour=datetime.fromtimestamp(ts).astimezone().hour
+            hourly_counts[hour]=hourly_counts.get(hour,0)+1
+        except (TypeError,ValueError,OverflowError,OSError):
+            continue
+    anomaly_threshold=max(1500, round(statistics.median([abs(e['delta']) for e in events])*3)) if events else 1500
+    recent_cutoff=time.time()-3600
+    recent_anomalies=[{'timestamp':datetime.fromtimestamp(e['ts']).astimezone().strftime('%d.%m.%Y %H:%M:%S'),
+                       'delta_w':round(e['delta']),'threshold_w':anomaly_threshold}
+                      for e in events if e['ts']>=recent_cutoff and abs(e['delta'])>=anomaly_threshold][-20:]
+    recurrence_analysis={
+      'anomaly_threshold_w':anomaly_threshold,
+      'recent_anomalies':recent_anomalies,
+      'most_sampled_hours':[{'hour':h,'samples':n} for h,n in sorted(hourly_counts.items(),key=lambda item:item[1],reverse=True)[:5]],
+      'note':'Auffälligkeitsschwelle basiert auf der historischen Verteilung der erkannten Lastsprünge; sie benennt keinen Verbraucher.'}
+    # Advisory-only instantaneous interpretation. Do not propose battery/grid
+    # actions until the grid sensor sign has been verified by the installer.
+    latest_values=(rows[-1].get('values') or {}) if rows else {}
+    try: current_load=max(0,round(float(latest_values.get('load_power'))))
+    except (TypeError,ValueError,OverflowError): current_load=None
+    try: current_pv=max(0,round(float(latest_values.get('pv_power'))))
+    except (TypeError,ValueError,OverflowError): current_pv=None
+    st=config().get('settings',{})
+    limit=int(st.get('grid_import_limit_w',5000) or 5000)
+    recommendation_reasons=[]
+    if current_load is None or current_pv is None:
+        recommendation='Noch keine ausreichenden aktuellen Hauslast- und PV-Werte für eine Empfehlung.'
+        recommendation_reasons.append('Mindestens ein erforderlicher Messwert fehlt oder ist ungültig.')
+    elif st.get('grid_import_sign','unverified')=='unverified':
+        recommendation='Zuerst das Vorzeichen des Netzleistungssensors in der Konfiguration bestätigen. Bis dahin keine Netz- oder Speicherempfehlung.'
+        recommendation_reasons.append('Das Netzleistungs-Vorzeichen ist nicht bestätigt; Netzbezug und Einspeisung wären sonst verwechselbar.')
+    elif current_pv>=current_load:
+        recommendation='Die gemessene PV-Leistung deckt die aktuelle Hauslast rechnerisch. Speicherladung oder Einspeisung hängt von den tatsächlichen Wechselrichterwerten ab.'
+        recommendation_reasons.append(f'PV {current_pv} W liegt mindestens auf Höhe der Hauslast {current_load} W.')
+    else:
+        deficit=current_load-current_pv
+        recommendation=f'Aktuell fehlen gegenüber der Hauslast rund {deficit} W PV-Leistung. Der Speicher kann diesen Anteil nur innerhalb seiner Leistungsgrenze und oberhalb der Reserve übernehmen; andernfalls bleibt Netzbezug.'
+        recommendation_reasons.append(f'Hauslast {current_load} W minus PV {current_pv} W ergibt rechnerisch {deficit} W Restbedarf.')
+        recommendation_reasons.append(f'Konfigurierte Netzbezugsgrenze: {limit} W; dies ist ein Zielwert, keine Abschaltung.')
     return {'engine':'Energy Brain local v3','method':'Anlagenweite Musteranalyse aus Hauslast, Netz, Batterie und PV; Lastsprünge und Zyklusprofile sind erklärbare statistische Merkmale. Das neuronale Netz prognostiziert den aggregierten Hausverbrauch. Geräteidentitäten sind ausdrücklich nicht erforderlich.',
       'samples_used':min(len(rows),50000),'events_found':len(events),'profiles':profiles,
       'paired_cycles_found':len(cycles),'cycle_profiles':learned_cycles,
@@ -788,17 +1036,73 @@ def build_energy_brain(rows):
       'energy_balance':{'formula':'PV − Batterie − Netz − Hauslast','valid_samples':balance_valid,
           'skipped_samples':balance_skipped,'mae_w':balance_mae,'median_abs_error_w':balance_median,
           'status':balance_status,'note':'Diagnosewert; Abweichungen können durch Messpunkte, Verluste und unterschiedliche Sensorzeitpunkte entstehen.'},
+      'recurrence_analysis':recurrence_analysis,
+      'recommendation':{'text':recommendation,'reasons':recommendation_reasons,'current_load_w':current_load,'current_pv_w':current_pv,'grid_import_limit_w':limit,'mode':'Nur Empfehlung; keine Steuerbefehle.'},
       'limitations':['Das Ziel ist die Erkennung wiederkehrender Anlagen- und Energiemuster; Gerätenamen oder manuelle Gerätezuordnungen sind nicht erforderlich.','Zykluslaufzeiten sind heuristische Zuordnungen innerhalb eines 45-Minuten-Fensters; überlagerte Lasten können sie weiterhin verfälschen.','Das neuronale Netz prognostiziert aktuell den aggregierten Hausverbrauch und klassifiziert noch keine Betriebszustände.','Prognosen und Profile sind Beobachtungswerte, keine Steuerentscheidungen.'],
       'neural_network':neural, 'multichannel_forecast':multichannel, 'multichannel_forecast':multichannel,'active_control_enabled':False,'commands_sent':False}
 
+ENERGY_BRAIN_CACHE={'key':None,'created':0.0,'result':None}
+ENERGY_BRAIN_CACHE_LOCK=threading.Lock()
+
+def get_energy_brain():
+    """Avoid retraining all local models on every page render or question."""
+    try:
+        stat=HIST.stat()
+        key=(stat.st_mtime_ns,stat.st_size)
+    except OSError:
+        key=(None,0)
+    now=time.time()
+    with ENERGY_BRAIN_CACHE_LOCK:
+        if (ENERGY_BRAIN_CACHE['result'] is not None
+                and now-ENERGY_BRAIN_CACHE['created']<30):
+            return ENERGY_BRAIN_CACHE['result']
+        result=build_energy_brain(learning_rows())
+        ENERGY_BRAIN_CACHE.update(key=key,created=now,result=result)
+        return result
+
 @app.route('/energy-brain')
 def energy_brain():
-    result=build_energy_brain(learning_rows())
-    return render_template('energy_brain.html',brain=result)
+    try:
+        result=get_energy_brain()
+        return render_template('energy_brain.html',brain=result)
+    except Exception as exc:
+        app.logger.exception('Energy Brain konnte nicht aufgebaut werden')
+        return render_template('energy_brain.html',brain={
+            'samples_used':0,'events_found':0,'profiles':[],'data_gaps_over_30s':0,
+            'status':'Auswertung fehlgeschlagen: '+str(exc)[:240],
+            'neural_network':{'model':'–','training_samples':0,'mae_w':None,'next_load_prediction_w':None,'status':'Nicht verfügbar'},
+            'multichannel_forecast':{'channels':[],'model':'–','architecture':'–','trained_channels':0},
+            'persistent_pattern_memory':{'stored_signatures':0,'new_events':0,'top_patterns':[],'status':'Nicht verfügbar'},
+            'recurrence_analysis':{'anomaly_threshold_w':0,'recent_anomalies':[],'most_sampled_hours':[]},
+            'recommendation':{'text':'Keine Empfehlung verfügbar.','reasons':[],'current_load_w':None,'current_pv_w':None,'mode':'Nur Empfehlung; keine Steuerbefehle.'},
+            'paired_cycles_found':0,'cycle_profiles':[],'method':'Die Details stehen im Home-Assistant-Protokoll.',
+            'limitations':['Die Auswertung konnte nicht abgeschlossen werden. Bitte Home-Assistant-Protokoll prüfen.']})
 
 @app.route('/api/energy-brain')
 def api_energy_brain():
-    return jsonify(build_energy_brain(learning_rows()))
+    return jsonify(get_energy_brain())
+
+@app.route('/api/energy-brain/explain',methods=['POST'])
+def api_energy_brain_explain():
+    """Give a local, source-grounded explanation of the current advisory."""
+    question=(request.get_json(silent=True) or {}).get('question','')
+    question=' '.join(str(question).strip().split())[:500]
+    if not question:
+        return jsonify({'answer':'Bitte stelle eine kurze Frage zur aktuellen Empfehlung.'}),400
+    brain=get_energy_brain()
+    rec=brain.get('recommendation') or {}
+    q=question.casefold()
+    reasons=rec.get('reasons') or []
+    answer=' '.join([rec.get('text','Zurzeit liegt keine Empfehlung vor.'),*reasons])
+    if any(word in q for word in ('netz','strom','spitze','limit')):
+        answer += f" Netzbezugsgrenze laut Konfiguration: {rec.get('grid_import_limit_w','unbekannt')} W. Sie ist ein Zielwert und keine harte Abschaltung."
+        if config().get('settings',{}).get('grid_import_sign','unverified')=='unverified':
+            answer += ' Das Vorzeichen des Netzsensors ist noch nicht bestätigt; deshalb wird kein Netzbezug aus dem Messwert abgeleitet.'
+    if any(word in q for word in ('speicher','batterie','akku','reserve')):
+        answer += ' Eine konkrete Lade- oder Entladevorgabe wird derzeit nicht berechnet, weil SoC, Batterie-Leistungsgrenzen, Reserve und geprüfte Register gemeinsam bewertet werden müssen. Es werden keine Wechselrichterbefehle gesendet.'
+    if any(word in q for word in ('pv','solar','sonne')):
+        answer += f" Verwendete Momentanwerte: PV {rec.get('current_pv_w','unbekannt')} W, Hauslast {rec.get('current_load_w','unbekannt')} W. Das ist eine Momentaufnahme, keine Tagesprognose."
+    return jsonify({'question':question,'answer':answer,'mode':'lokal · regelbasiert und messwertgestützt','commands_sent':False})
 
 @app.route('/api/learned-load-patterns')
 def api_learned_load_patterns():
@@ -1470,6 +1774,6 @@ def api_night_plan():
 
 
 @app.route('/health')
-def health():return jsonify({'status':'ok','mode':'observe','active_control_enabled':False,'timestamp':datetime.now(timezone.utc).isoformat()})
+def health():return jsonify({'status':'ok','mode':'active_control' if CONTROL_RUNTIME.get('active') else 'observe','active_control_enabled':bool(CONTROL_RUNTIME.get('active')),'timestamp':datetime.now(timezone.utc).isoformat()})
 if __name__=='__main__':
- threading.Thread(target=sampler,daemon=True).start();app.run(host='0.0.0.0',port=int(os.getenv('PORT','8099')))
+ threading.Thread(target=sampler,daemon=True).start();threading.Thread(target=controller_loop,daemon=True).start();app.run(host='0.0.0.0',port=int(os.getenv('PORT','8099')))

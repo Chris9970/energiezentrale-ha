@@ -1,10 +1,13 @@
-## Version 1.2.24 – Energy Brain
-- Lokale Lastsprung-Erkennung und Gruppierung ähnlicher Ereignisse; neue Seite `/energy-brain` und API `/api/energy-brain`.
-- Keine Cloud, keine Steuerbefehle; Erkennungen bleiben zunächst unbestätigte Profile.
+## Version 1.2.25 – Energy Brain & optionale Speicherregelung
+- Energy Brain zeigt erklärbare Empfehlungen und beantwortet lokale Fragen zu PV, Netz und Speicher.
+- Energy Brain-Auswertung wird zwischengespeichert; die fehlende Auffälligkeitsanalyse für die Seite ist ergänzt.
+- Optionaler Sofar HYD Passivmodus-Regler für das parallele Master/Slave-Paar: Anlagen-Gesamtleistungen werden durch zwei geteilt. Bei 30 kW Gesamt-Entladegrenze bleiben bis zu −15 kW je Wechselrichter gesetzt. Laden ist auf den gemessenen PV-Überschuss nach Sicherheitsabstand begrenzt.
+- Steuerung bleibt standardmäßig aus und wird vor jedem Lauf gegen Sensorstatus, Vorzeichen, Einheiten, Registergrenzen und einen 5-Minuten-Watchdog mit Rückkehr zum vorherigen Modus geprüft.
+- Unterstützt wird ein Master/Slave-Paar, bei dem der Master den identischen Sollwert an beide Geräte verteilt; getrennte Steuer-Entitäten sind nicht unterstützt.
 
 # Energiezentrale 1.1.3
 
-Read-only Home Assistant energy analysis add-on. Keeps prior overview, simulation, configuration, consumer planning, learning/history, diagnostics and daily energy pages.
+Home Assistant energy analysis and optional control add-on. Keeps prior overview, simulation, configuration, consumer planning, learning/history, diagnostics and daily energy pages.
 
 ## New in 1.1.3
 - PV forecast semantics can be configured as whole-day total or remaining-day forecast.
@@ -21,7 +24,7 @@ Read-only Home Assistant energy analysis add-on. Keeps prior overview, simulatio
 - All calculations are advisory. The PV forecast is interpreted according to the explicit configuration choice (daily total vs. remaining-day forecast); this remains an estimate, not a guaranteed surplus.
 
 ## Safety
-Active control is forced off and the application does not send inverter or consumer commands. Energy estimates depend on sensor mapping, units, sign conventions and history coverage. Large data gaps are skipped; peak counts are samples above threshold, not deduplicated events. The battery power convention used is negative=discharge and positive=charge, based on the observed Sofar history.
+Active control is opt-in and remains disabled by default. It supports one configured master control entity set that distributes identical per-inverter settings to a two-inverter master/slave pair. It requires verified grid-sensor polarity, fresh measurements in W and %, compatible Solax Modbus control entities, and a confirmed 5-minute watchdog configured to return to the previous mode. A control failure disables the setting and attempts to restore the saved mode; the inverter watchdog is the fallback. This assumes the master entity broadcasts its per-inverter setpoints to the slave, as confirmed for this installation. Failed state restoration, network interruptions and unknown firmware behavior must be reviewed in Home Assistant before enabling. No consumer devices are switched. Energy estimates also depend on sensor mapping and history coverage.
 
 ## Validation
 Python syntax/AST and ZIP integrity checked. Python syntax compilation, Jinja template parsing, and ZIP integrity were tested. Full Home Assistant runtime test was not possible in the build environment because Flask is not installed there.
