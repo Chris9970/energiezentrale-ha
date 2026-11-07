@@ -5,7 +5,7 @@
 - Steuerung bleibt standardmäßig aus und wird vor jedem Lauf gegen Sensorstatus, Vorzeichen, Einheiten, Registergrenzen und einen 5-Minuten-Watchdog mit Rückkehr zum vorherigen Modus geprüft.
 - Unterstützt wird ein Master/Slave-Paar, bei dem der Master den identischen Sollwert an beide Geräte verteilt; getrennte Steuer-Entitäten sind nicht unterstützt.
 
-# Energiezentrale 1.1.3
+# Energiezentrale 1.2.26
 
 Home Assistant energy analysis and optional control add-on. Keeps prior overview, simulation, configuration, consumer planning, learning/history, diagnostics and daily energy pages.
 

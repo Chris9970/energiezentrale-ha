@@ -135,6 +135,9 @@ def config():
    try: save(c)
    except Exception: pass
   for k,v in DEFAULT['control_entities'].items(): c['control_entities'].setdefault(k,v)
+  for consumer in c.get('consumers',[]):
+   consumer.setdefault('management_mode','advisory')
+   consumer.setdefault('external_reserve_power_w',consumer.get('nominal_power_w',0))
   return c
  except Exception: return json.loads(json.dumps(DEFAULT))
 def save(c): CFG.write_text(json.dumps(c,ensure_ascii=False,indent=2))
@@ -162,9 +165,16 @@ def get_value(eid):
  try:v=float(s.get('state'))
  except (ValueError,TypeError):v=None
  return {'value':v,'state':s.get('state'),'unit':s.get('attributes',{}).get('unit_of_measurement',''),'updated':s.get('last_updated')}
+def _value_from_state(state):
+ if not isinstance(state,dict):return None
+ try:v=float(state.get('state'))
+ except (ValueError,TypeError):v=None
+ return {'value':v,'state':state.get('state'),'unit':state.get('attributes',{}).get('unit_of_measurement',''),'updated':state.get('last_updated')}
 def snapshot():
  c=config()
- values={k:get_value(v.get('entity_id','')) for k,v in c['sensors'].items()}
+ all_states,err=ha('states')
+ by_id={s.get('entity_id'):s for s in all_states if isinstance(s,dict)} if isinstance(all_states,list) else {}
+ values={k:_value_from_state(by_id.get(v.get('entity_id',''))) for k,v in c['sensors'].items()}
  consumer_values={}
  for consumer in c.get('consumers',[]):
   cid=str(consumer.get('id',''))
@@ -173,9 +183,9 @@ def snapshot():
   for key in ('pressure_sensor_entity','temperature_sensor_entity','compressor_state_entity'):
    entity=consumer.get(key,'')
    if entity:
-    cv[key]=get_value(entity)
+    cv[key]=_value_from_state(by_id.get(entity))
   if cv: consumer_values[cid]=cv
- return {'timestamp':datetime.now(timezone.utc).isoformat(),'values':values,'consumer_values':consumer_values}
+ return {'timestamp':datetime.now(timezone.utc).isoformat(),'values':values,'consumer_values':consumer_values,'ha_error':err}
 def sampler():
  while True:
   try:
@@ -614,6 +624,7 @@ def consumers():
   ids=request.form.getlist('consumer_id')
   names=request.form.getlist('consumer_name'); types=request.form.getlist('consumer_type')
   powers=request.form.getlist('consumer_power'); priorities=request.form.getlist('consumer_priority')
+  management_modes=request.form.getlist('consumer_management_mode'); external_reserves=request.form.getlist('consumer_external_reserve')
   enabled=request.form.getlist('consumer_enabled'); modes=request.form.getlist('consumer_mode')
   stages_list=request.form.getlist('consumer_stages'); mins=request.form.getlist('consumer_min_power'); maxs=request.form.getlist('consumer_max_power')
   sensors=request.form.getlist('consumer_pressure_sensor'); pmins=request.form.getlist('consumer_pressure_min'); pmaxs=request.form.getlist('consumer_pressure_max')
@@ -626,6 +637,8 @@ def consumers():
    x['nominal_power_w']=num(powers[i] if i<len(powers) else x.get('nominal_power_w',0),x.get('nominal_power_w',0))
    x['priority']=num(priorities[i] if i<len(priorities) else x.get('priority',3),3,1,99)
    x['enabled']=str(x['id']) in request.form.getlist('consumer_enabled') or str(i) in enabled
+   x['management_mode']=management_modes[i] if i<len(management_modes) and management_modes[i] in ('advisory','external') else x.get('management_mode','advisory')
+   x['external_reserve_power_w']=num(external_reserves[i] if i<len(external_reserves) else x.get('external_reserve_power_w',x.get('nominal_power_w',0)),x.get('nominal_power_w',0),0,250000)
    x['operation_mode']=modes[i] if i<len(modes) and modes[i] in ('staged','stepless') else x.get('operation_mode','staged')
    raw=stages_list[i] if i<len(stages_list) else ''
    try: parsed=sorted({num(v.strip(),0,1,x['nominal_power_w'] or 250000) for v in raw.replace(';',',').split(',') if v.strip()})
@@ -664,7 +677,7 @@ def consumers():
    stages=sorted({num(v.strip(),0,1,power or 250000) for v in raw.replace(';',',').split(',') if v.strip()}) if mode=='staged' else []
    entity=request.form.get('new_pressure_sensor','').strip()
    if entity and not (entity.startswith(('sensor.','input_number.')) and ' ' not in entity): entity=''
-   c['consumers'].append({'id':'consumer_'+str(time.time_ns()),'name':name,'type':typ,'enabled':True,'nominal_power_w':power,'stages_w':stages,'priority':num(request.form.get('new_priority','3'),3,1,99),'operation_mode':mode,'min_power_w':num(request.form.get('new_min_power','0'),0,0,power),'max_power_w':num(request.form.get('new_max_power',str(power)),power,0,250000),'pressure_sensor_entity':entity,'pressure_min_bar':max(0.0,min(30.0,float(request.form.get('new_pressure_min','4.5') or 4.5))),'pressure_max_bar':max(0.0,min(30.0,float(request.form.get('new_pressure_max','7') or 7))),
+   c['consumers'].append({'id':'consumer_'+str(time.time_ns()),'name':name,'type':typ,'enabled':True,'nominal_power_w':power,'stages_w':stages,'priority':num(request.form.get('new_priority','3'),3,1,99),'management_mode':request.form.get('new_management_mode','advisory') if request.form.get('new_management_mode') in ('advisory','external') else 'advisory','external_reserve_power_w':num(request.form.get('new_external_reserve',str(power)),power,0,250000),'operation_mode':mode,'min_power_w':num(request.form.get('new_min_power','0'),0,0,power),'max_power_w':num(request.form.get('new_max_power',str(power)),power,0,250000),'pressure_sensor_entity':entity,'pressure_min_bar':max(0.0,min(30.0,float(request.form.get('new_pressure_min','4.5') or 4.5))),'pressure_max_bar':max(0.0,min(30.0,float(request.form.get('new_pressure_max','7') or 7))),
     'receiver_volume_l':num(request.form.get('new_receiver_volume','500'),500,1,100000),
     'compressor_on_bar':max(0.0,min(30.0,float(request.form.get('new_on_bar','6') or 6))),
     'compressor_off_bar':max(0.0,min(30.0,float(request.form.get('new_off_bar','8') or 8))),
@@ -672,7 +685,7 @@ def consumers():
     'compressor_state_entity':request.form.get('new_state_sensor','').strip(),
     'temperature_sensor_entity':request.form.get('new_temperature_sensor','').strip(),
     'target_temperature_c':max(-20.0,min(100.0,float(request.form.get('new_target_temperature','20') or 20)))})
-  save(c); flash('Verbraucher gespeichert. Die Angaben sind nur für Planung und Empfehlungen; es werden keine Geräte geschaltet.','success')
+  save(c); flash('Verbraucher gespeichert. Extern geregelte Lasten werden in der Überschussplanung berücksichtigt; diese App schaltet keine Verbraucher.','success')
   return redirect(url_for('consumers'))
  return render_template('consumers.html',cfg=c)
 
@@ -725,6 +738,8 @@ def learn_load_patterns(rows, days=14, min_power_w=1000, min_days=3):
 # Self-supervised next-sample forecasting: previous six load samples -> next load.
 # This is a real trained MLP, but it predicts aggregate load; it does not label appliances.
 BRAIN_MODEL = DATA / 'brain_mlp_model.json'
+BRAIN_TRAIN_LOCK=threading.Lock()
+MODEL_RETRAIN_BATCH=300
 
 def _sigmoid_tanh(x):
     x=max(-20.0,min(20.0,x))
@@ -754,10 +769,13 @@ def train_load_mlp(rows, force=False):
     test_seq=seq[split:] or seq[-min(100,len(seq)):]
     try:
         old=json.loads(BRAIN_MODEL.read_text())
-        if not force and old.get('training_samples')==signature and old.get('version')==2:
+        old_samples=int(old.get('training_samples',0))
+        if (not force and old.get('version')==2 and signature>=old_samples
+                and signature-old_samples<MODEL_RETRAIN_BATCH):
             model=old
         else: model=None
     except Exception: model=None
+    newly_trained = model is None
     if model is None:
         # Deterministic small initial weights, no external packages or network.
         h=8; w1=[[(((i+1)*(j+3)%17)-8)*0.006 for i in range(6)] for j in range(h)]
@@ -786,10 +804,12 @@ def train_load_mlp(rows, force=False):
         return sum(model['w2'][j]*hidden[j] for j in range(8))+model['b2']
     check=test_seq
     mae=sum(abs(predict(x)-y)*20000.0 for x,y in check)/len(check)
+    baseline_mae=sum(abs(x[-1]-y)*20000.0 for x,y in check)/len(check)
+    improvement=((baseline_mae-mae)/baseline_mae*100.0) if baseline_mae>0 else 0.0
     latest=[v/20000.0 for _,v in valid[-6:]]
     next_w=max(0.0,predict(latest)*20000.0) if len(latest)==6 else None
-    return {'trained':True,'status':'Neuronales Netz trainiert' if model.get('training_samples')==signature else 'Neuronales Netz aktiv',
-            'training_samples':signature,'training_sequences':len(train_seq),'validation_sequences':len(test_seq),'mae_w':round(mae),'next_load_prediction_w':round(next_w) if next_w is not None else None,
+    return {'trained':True,'status':'Neu trainiert' if newly_trained else 'Aktiv · wartet auf weiteren Lernblock',
+            'training_samples':model.get('training_samples',signature),'available_sequences':signature,'training_sequences':model.get('training_sequences',len(train_seq)),'validation_sequences':len(test_seq),'mae_w':round(mae),'baseline_mae_w':round(baseline_mae),'improvement_pct':round(improvement,1),'beats_baseline':mae<baseline_mae,'next_load_prediction_w':round(next_w) if next_w is not None else None,
             'model':model['model'],'trained_at':model.get('trained_at'),'architecture':'6 Eingänge · 8 Neuronen · 1 Ausgang',
             'target':'Hausverbrauch in ca. 10 Sekunden; selbstüberwachtes Prognose-Training'}
 
@@ -827,7 +847,10 @@ def train_multichannel_mlp(rows, force=False):
             continue
         split=max(100,int(sig*.8)); train_seq=seq[:split]; test_seq=seq[split:] or seq[-min(100,len(seq)):]
         model=old.get('channels',{}).get(key)
-        if force or not isinstance(model,dict) or model.get('version')!=1 or sig-int(model.get('training_samples',0))>=500:
+        old_samples=int(model.get('training_samples',0)) if isinstance(model,dict) else 0
+        newly_trained = (force or not isinstance(model,dict) or model.get('version')!=1
+                or sig<old_samples or sig-old_samples>=MODEL_RETRAIN_BATCH)
+        if newly_trained:
             h=8; w1=[[((((i+1)*(j+3))%17)-8)*.006 for i in range(6)] for j in range(h)]
             b1=[0.0]*h; w2=[((((j+2)%7)-3)*.01) for j in range(h)]; b2=0.0; lr=.015
             for epoch in range(9):
@@ -849,7 +872,7 @@ def train_multichannel_mlp(rows, force=False):
         nxt=pred([v/scale for _,v in vals[-6:]])*scale if len(vals)>=6 else None
         if nonnegative and nxt is not None: nxt=max(0,nxt)
         models[key]=model
-        result.append({'key':key,'label':label,'trained':True,'samples':sig,'training_samples':len(train_seq),'validation_samples':len(test_seq),'mae_w':round(mae),'baseline_mae_w':round(baseline_mae),'improvement_pct':round(improvement,1),'beats_baseline':mae<baseline_mae,'next_w':round(nxt) if nxt is not None else None,'status':'Trainiert · Zukunftsprüfung'})
+        result.append({'key':key,'label':label,'trained':True,'samples':sig,'training_samples':model.get('training_samples',sig),'available_samples':sig,'validation_samples':len(test_seq),'mae_w':round(mae),'baseline_mae_w':round(baseline_mae),'improvement_pct':round(improvement,1),'beats_baseline':mae<baseline_mae,'next_w':round(nxt) if nxt is not None else None,'status':'Neu trainiert · Zukunftsprüfung' if newly_trained else 'Aktiv · wartet auf weiteren Lernblock'})
     if models:
         try:
             tmp=BRAIN_MULTI_MODEL.with_suffix('.tmp'); tmp.write_text(json.dumps({'version':1,'channels':models,'signatures':signatures})); tmp.replace(BRAIN_MULTI_MODEL)
@@ -858,8 +881,9 @@ def train_multichannel_mlp(rows, force=False):
 
 # Energy Brain: local, explainable unsupervised load-event learning. No cloud/commands.
 def build_energy_brain(rows):
-    neural=train_load_mlp(rows)
-    multichannel=train_multichannel_mlp(rows)
+    with BRAIN_TRAIN_LOCK:
+        neural=train_load_mlp(rows)
+        multichannel=train_multichannel_mlp(rows)
     events=[]; prev=None
     for row in rows[-50000:]:
         try:
@@ -1060,6 +1084,23 @@ def get_energy_brain():
         ENERGY_BRAIN_CACHE.update(key=key,created=now,result=result)
         return result
 
+def model_learning_loop():
+    """Train local forecasts in bounded batches without requiring a page visit."""
+    while True:
+        try:
+            rows=learning_rows()
+            with BRAIN_TRAIN_LOCK:
+                load_model=train_load_mlp(rows)
+                channel_models=train_multichannel_mlp(rows)
+            if load_model.get('status')=='Neu trainiert' or any(
+                    str(c.get('status','')).startswith('Neu trainiert')
+                    for c in channel_models.get('channels',[])):
+                app.logger.info('Energy Brain hat neue lokale Lernmodelle trainiert (%s Messfolgen).',len(rows))
+            if 'ENERGY_BRAIN_CACHE' in globals(): ENERGY_BRAIN_CACHE['created']=0
+        except Exception:
+            app.logger.exception('Lokales Energy-Brain-Training fehlgeschlagen')
+        time.sleep(300)
+
 @app.route('/energy-brain')
 def energy_brain():
     try:
@@ -1210,8 +1251,32 @@ def api_consumer_plan():
     consumers = sorted((x for x in c.get('consumers', []) if x.get('enabled')),
                        key=lambda x: int(x.get('priority', 99)))
     remaining = available_w
+    external_reserved_w = 0
+    state_text = {'on','true','1','running','heat','heating'}
+    external_states = {}
+    for consumer in consumers:
+        if consumer.get('management_mode') != 'external':
+            continue
+        consumer_snapshot = (snap.get('consumer_values', {}).get(str(consumer.get('id','')), {}) or {})
+        state = consumer_snapshot.get('compressor_state_entity') or {}
+        raw_state = str(state.get('state', '')).strip().lower()
+        active = raw_state in state_text
+        external_states[str(consumer.get('id'))] = (active, raw_state)
+        if not active:
+            external_reserved_w += max(0, int(consumer.get('external_reserve_power_w', consumer.get('nominal_power_w', 0)) or 0))
+    if remaining is not None:
+        remaining = max(0.0, remaining - external_reserved_w)
     if remaining is not None:
         for consumer in consumers:
+            if consumer.get('management_mode') == 'external':
+                active, raw_state = external_states.get(str(consumer.get('id')), (False, ''))
+                reserve = 0 if active else max(0, int(consumer.get('external_reserve_power_w', consumer.get('nominal_power_w', 0)) or 0))
+                recommendations.append({'id':consumer.get('id'),'name':consumer.get('name','Verbraucher'),
+                    'priority':int(consumer.get('priority',99)),'nominal_power_w':max(0,int(consumer.get('nominal_power_w',0))),
+                    'suggested_power_w':0,'status':'external','pressure_bar':None,'temperature_c':None,
+                    'note':('Läuft laut Statussensor; der aktuelle Verbrauch steckt bereits in der Netzmessung.' if active else
+                            f'Extern geregelt durch Home Assistant; {reserve} W vorsorglich reserviert. Status unbekannt/aus ({raw_state or "kein Statussensor"}).')})
+                continue
             try:
                 stages = sorted({int(v) for v in consumer.get('stages_w', []) if int(v) > 0})
             except (TypeError, ValueError):
@@ -1219,8 +1284,9 @@ def api_consumer_plan():
             nominal = max(0, int(consumer.get('nominal_power_w', 0)))
             options = [v for v in stages if v <= remaining]
             chosen = max(options) if options else (nominal if nominal and nominal <= remaining else 0)
-            pressure = get_value(consumer.get('pressure_sensor_entity','')) if consumer.get('pressure_sensor_entity') else None
-            temp = get_value(consumer.get('temperature_sensor_entity','')) if consumer.get('temperature_sensor_entity') else None
+            consumer_snapshot=(snap.get('consumer_values',{}).get(str(consumer.get('id','')),{}) or {})
+            pressure=consumer_snapshot.get('pressure_sensor_entity')
+            temp=consumer_snapshot.get('temperature_sensor_entity')
             note = (f'{chosen} W passen rechnerisch in den verfügbaren Überschuss.' if chosen > 0
                     else 'Der verfügbare Überschuss reicht mit Sicherheitsabstand nicht für eine Stufe.')
             if pressure and pressure.get('value') is not None:
@@ -1249,6 +1315,8 @@ def api_consumer_plan():
         'timestamp': snap.get('timestamp'), 'mode': 'advisory_only', 'commands_sent': False,
         'grid_import_sign': sign, 'grid_power_raw_w': raw, 'estimated_export_w': export_w,
         'safety_margin_w': margin_w, 'available_surplus_after_margin_w': available_w,
+        'external_reserved_w': external_reserved_w,
+        'recommendable_surplus_w': max(0.0, available_w-external_reserved_w) if available_w is not None else None,
         'recommendations': recommendations,
         'warning': ('Netzleistungs-Vorzeichen erst in der Konfiguration bestätigen.' if export_w is None else
                     'Nur Vorschlag: keine Verbraucher werden geschaltet. Vor dem Betrieb Anlaufstrom, Mindestlaufzeiten und Verriegelungen berücksichtigen.')
@@ -1257,7 +1325,7 @@ def api_consumer_plan():
 @app.route('/api/compressor-analysis')
 def api_compressor_analysis():
     """Estimate receiver pressure decay from stored samples; never claims a confirmed leak."""
-    c=config(); now=time.time(); results=[]
+    c=config(); now=time.time(); results=[]; snap=snapshot()
     try: rows=[json.loads(line) for line in HIST.read_text().splitlines()[-50000:] if line.strip()] if HIST.exists() else []
     except Exception: rows=[]
     for consumer in c.get('consumers',[]):
@@ -1283,7 +1351,7 @@ def api_compressor_analysis():
                     rate=drop/span
                     volume=max(1,float(consumer.get('receiver_volume_l',500)))
                     loss=volume*rate # approximate free-air L/h, gauge pressure drop approximation
-        current=get_value(entity)
+        current=(snap.get('consumer_values',{}).get(cid,{}) or {}).get('pressure_sensor_entity')
         results.append({'id':cid,'name':consumer.get('name','Kompressor'),'receiver_volume_l':consumer.get('receiver_volume_l',500),
             'pressure_bar':current.get('value') if current else None,'pressure_min_bar':consumer.get('pressure_min_bar',4.5),
             'compressor_on_bar':consumer.get('compressor_on_bar',6),'compressor_off_bar':consumer.get('compressor_off_bar',8),
@@ -1776,4 +1844,4 @@ def api_night_plan():
 @app.route('/health')
 def health():return jsonify({'status':'ok','mode':'active_control' if CONTROL_RUNTIME.get('active') else 'observe','active_control_enabled':bool(CONTROL_RUNTIME.get('active')),'timestamp':datetime.now(timezone.utc).isoformat()})
 if __name__=='__main__':
- threading.Thread(target=sampler,daemon=True).start();threading.Thread(target=controller_loop,daemon=True).start();app.run(host='0.0.0.0',port=int(os.getenv('PORT','8099')))
+ threading.Thread(target=sampler,daemon=True).start();threading.Thread(target=model_learning_loop,daemon=True).start();threading.Thread(target=controller_loop,daemon=True).start();app.run(host='0.0.0.0',port=int(os.getenv('PORT','8099')))
