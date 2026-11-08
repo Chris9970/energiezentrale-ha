@@ -4,8 +4,10 @@ from pathlib import Path
 from flask import Flask,render_template,request,redirect,url_for,flash,jsonify
 import requests
 app=Flask(__name__); app.secret_key='local-energy-app'
-DATA=Path('/data'); DATA.mkdir(exist_ok=True); CFG=DATA/'config.json'; HIST=DATA/'history.jsonl'; LEARN_STATE=DATA/'learning_state.json'
+DATA=Path(os.getenv('DATA_DIR','/data')); DATA.mkdir(parents=True,exist_ok=True); CFG=DATA/'config.json'; HIST=DATA/'history.jsonl'; LEARN_STATE=DATA/'learning_state.json'
 OPTIMIZER_REPORT_FILE=DATA/'daily_optimizer_report.json'
+OPTIMIZER_FEEDBACK_FILE=DATA/'optimizer_feedback.jsonl'
+OPTIMIZER_FEEDBACK_LOCK=threading.Lock()
 
 def learning_start_timestamp():
     """Persist the start of the new learning period; old history is excluded."""
@@ -21,13 +23,24 @@ def learning_start_timestamp():
     except Exception: pass
     return value
 
+def history_tail_lines(path, limit):
+    """Read only the newest rows, avoiding a full multi-week history load."""
+    chunks=[]; size=0; line_count=0; position=path.stat().st_size; chunk_size=1024*1024
+    with path.open('rb') as source:
+        while position>0 and line_count<=limit:
+            take=min(chunk_size,position); position-=take; source.seek(position); chunk=source.read(take)
+            chunks.insert(0,chunk); size+=len(chunk); line_count+=chunk.count(b'\n')
+            if size>64*1024*1024: break
+    lines=b''.join(chunks).splitlines()[-max(1,int(limit)):]
+    return [line.decode('utf-8','replace') for line in lines]
+
 def learning_rows(limit=100000):
     """Return only samples recorded since this learning feature was first activated."""
     started=learning_start_timestamp()
     if not HIST.exists(): return []
     rows=[]
     try:
-        for line in HIST.read_text().splitlines()[-limit:]:
+        for line in history_tail_lines(HIST,limit):
             if not line.strip(): continue
             try: row=json.loads(line); ts=datetime.fromisoformat(row.get('timestamp','').replace('Z','+00:00')).timestamp()
             except Exception: continue
@@ -116,8 +129,8 @@ DEFAULT={'plant_name':'Meine Energiezentrale','sensors':{
 'battery_soc':{'label':'Batterieladezustand (SoC)','entity_id':'sensor.sofar_speicher_battery_soc','unit':'%'},
 'inverter_output':{'label':'Wechselrichter-Ausgangsleistung','entity_id':'sensor.sofar_speicher_active_power_output_total','unit':'W'},
 'pv_forecast':{'label':'PV-Prognose','entity_id':'sensor.solcast_pv_forecast_prognose_heute','unit':'Wh'}},
-'consumers':[{'id':'heater','name':'Elektroheizung','type':'heater','enabled':True,'nominal_power_w':30000,'stages_w':[7500,15000,22500,30000],'priority':1,'temperature_sensor_entity':'','target_temperature_c':55.0},{'id':'compressor','name':'Kompressor','type':'motor','enabled':True,'nominal_power_w':11000,'stages_w':[],'priority':2,'pressure_sensor_entity':'','pressure_min_bar':4.5,'pressure_max_bar':7.0,'receiver_volume_l':500,'compressor_on_bar':6.0,'compressor_off_bar':8.0,'leak_monitor_enabled':True,'compressor_state_entity':'','temperature_sensor_entity':'','target_temperature_c':20.0}],
-'control_entities':{'mode':'select.sofar_speicher_inverter_energy_storage_mode','grid_setpoint':'number.sofar_speicher_inverter_passive_desired_grid_power','charge_power':'number.sofar_speicher_inverter_passive_maximum_battery_power','discharge_power':'number.sofar_speicher_inverter_passive_minimum_battery_power','apply_button':'button.sofar_speicher_inverter_passive_update_battery_charge_discharge'},'settings':{'grid_import_limit_w':5000,'battery_reserve_percent':25,'inverter_count':2,'control_enabled':False,'mode':'observe','grid_setpoint_sign':'unverified','grid_import_sign':'unverified','battery_power_sign':'negative','night_start_hour':18,'morning_start_hour':5,'morning_end_hour':9,'learning_days':14,'morning_min_samples_per_day':60,'battery_capacity_kwh':80,'battery_discharge_power_kw':30,'silage_slots':['06:30','12:00','18:00'],'silage_flex_minutes':45,'silage_duration_minutes':15,'feeding_slots':['06:45','12:00','18:15'],'feeding_flex_minutes':10,'feeding_duration_minutes':8,'feeding_power_w':0,'consumer_surplus_margin_w':1000,'import_price_eur_kwh':0.30,'export_price_eur_kwh':0.04,'tariff_effective_month':'','tariff_history':[],'battery_roundtrip_efficiency':0.90,'peak_alert_w':5000,'balance_alert_pct':15,'pv_forecast_mode':'daily_total'}}
+'consumers':[{'id':'heater','name':'Elektroheizung','type':'heater','enabled':True,'nominal_power_w':30000,'stages_w':[7500,15000,20000,30000],'plan_runtime_minutes':60,'priority':1,'temperature_sensor_entity':'','target_temperature_c':55.0},{'id':'compressor','name':'Kompressor','type':'motor','enabled':True,'nominal_power_w':11000,'stages_w':[],'plan_runtime_minutes':20,'priority':2,'pressure_sensor_entity':'','pressure_min_bar':4.5,'pressure_max_bar':7.0,'receiver_volume_l':500,'compressor_on_bar':6.0,'compressor_off_bar':8.0,'leak_monitor_enabled':True,'compressor_state_entity':'','temperature_sensor_entity':'','target_temperature_c':20.0}],
+'control_entities':{'mode':'select.sofar_speicher_inverter_energy_storage_mode','grid_setpoint':'number.sofar_speicher_inverter_passive_desired_grid_power','charge_power':'number.sofar_speicher_inverter_passive_maximum_battery_power','discharge_power':'number.sofar_speicher_inverter_passive_minimum_battery_power','apply_button':'button.sofar_speicher_inverter_passive_update_battery_charge_discharge'},'settings':{'grid_import_limit_w':5000,'battery_reserve_percent':25,'battery_hard_min_percent':20,'inverter_count':2,'control_enabled':False,'mode':'observe','grid_setpoint_sign':'unverified','grid_import_sign':'unverified','battery_power_sign':'negative','night_start_hour':18,'morning_start_hour':5,'morning_end_hour':9,'learning_days':14,'morning_min_samples_per_day':60,'battery_capacity_kwh':80,'pv_peak_power_kw':50,'battery_discharge_power_kw':30,'silage_slots':['06:30','12:00','18:00'],'silage_flex_minutes':45,'silage_duration_minutes':15,'feeding_slots':['06:45','12:00','18:15'],'feeding_flex_minutes':10,'feeding_duration_minutes':8,'feeding_power_w':0,'consumer_surplus_margin_w':1000,'import_price_eur_kwh':0.30,'export_price_eur_kwh':0.04,'tariff_effective_month':'','tariff_history':[],'battery_roundtrip_efficiency':0.90,'peak_alert_w':5000,'balance_alert_pct':15,'pv_forecast_mode':'daily_total'}}
 def config():
  if not CFG.exists(): CFG.write_text(json.dumps(DEFAULT,ensure_ascii=False,indent=2))
  try:
@@ -137,10 +150,18 @@ def config():
    try: save(c)
    except Exception: pass
   for k,v in DEFAULT['control_entities'].items(): c['control_entities'].setdefault(k,v)
+  consumer_migrated=False
   for consumer in c.get('consumers',[]):
    consumer.setdefault('management_mode','advisory')
    consumer.setdefault('external_reserve_power_w',consumer.get('nominal_power_w',0))
    consumer.setdefault('surplus_pulse_enabled',False); consumer.setdefault('surplus_start_button_entity',''); consumer.setdefault('surplus_start_power_w',consumer.get('nominal_power_w',0))
+   consumer.setdefault('current_power_sensor_entity','')
+   consumer.setdefault('plan_runtime_minutes',60 if consumer.get('type')=='heater' else 20)
+   if consumer.get('type')=='heater' and consumer.get('stages_w')==[7500,15000,22500,30000]:
+    consumer['stages_w']=[7500,15000,20000,30000]; consumer_migrated=True
+  if consumer_migrated:
+   try: save(c)
+   except Exception: pass
   return c
  except Exception: return json.loads(json.dumps(DEFAULT))
 def save(c): CFG.write_text(json.dumps(c,ensure_ascii=False,indent=2))
@@ -172,7 +193,7 @@ def _value_from_state(state):
  if not isinstance(state,dict):return None
  try:v=float(state.get('state'))
  except (ValueError,TypeError):v=None
- return {'value':v,'state':state.get('state'),'unit':state.get('attributes',{}).get('unit_of_measurement',''),'updated':state.get('last_updated')}
+ return {'value':v,'state':state.get('state'),'unit':state.get('attributes',{}).get('unit_of_measurement',''),'updated':state.get('last_updated'),'attributes':state.get('attributes',{})}
 def snapshot():
  c=config()
  all_states,err=ha('states')
@@ -183,7 +204,7 @@ def snapshot():
   cid=str(consumer.get('id',''))
   if not cid: continue
   cv={}
-  for key in ('pressure_sensor_entity','temperature_sensor_entity','compressor_state_entity'):
+  for key in ('pressure_sensor_entity','temperature_sensor_entity','compressor_state_entity','current_power_sensor_entity'):
    entity=consumer.get(key,'')
    if entity:
     cv[key]=_value_from_state(by_id.get(entity))
@@ -257,8 +278,9 @@ def build_battery_plan(c, rows, snap=None):
     st = c.get('settings', {})
     sign = st.get('grid_import_sign', 'unverified')
     target_w = max(0.0, float(st.get('grid_import_limit_w', 5000)))
-    # The BTS battery/inverter lower limit is physically fixed at 20% for this installation.
-    reserve_pct = max(20.0, max(0.0, min(100.0, float(st.get('battery_reserve_percent', 20)))))
+    # Never forecast below the configured inverter/BMS hard floor; a higher app reserve may be used strategically.
+    hard_floor_pct = max(0.0, min(100.0, float(st.get('battery_hard_min_percent', 20))))
+    reserve_pct = max(hard_floor_pct, max(0.0, min(100.0, float(st.get('battery_reserve_percent', 20)))))
     capacity_kwh = max(0.0, float(st.get('battery_capacity_kwh', 80)))
     max_discharge_kw = max(0.0, float(st.get('battery_discharge_power_kw', 30)))
     morning_start = int(st.get('morning_start_hour', 5))
@@ -478,6 +500,8 @@ def config_page():
    c['settings']['battery_reserve_percent']=max(0,min(100,int(request.form.get('battery_reserve_percent','25'))))
    c['settings']['inverter_count']=max(1,min(2,int(request.form.get('inverter_count','2'))))
    c['settings']['battery_capacity_kwh']=max(1,min(500,int(request.form.get('battery_capacity_kwh','80'))))
+   c['settings']['pv_peak_power_kw']=max(1,min(500,float(request.form.get('pv_peak_power_kw','50'))))
+   c['settings']['battery_hard_min_percent']=max(0,min(95,int(request.form.get('battery_hard_min_percent','20'))))
    c['settings']['battery_discharge_power_kw']=max(1,min(100,int(request.form.get('battery_discharge_power_kw','30'))))
    c['settings']['control_margin_w']=max(100,min(3000,int(request.form.get('control_margin_w','300'))))
    c['settings']['battery_charge_power_kw']=max(1,min(100,int(request.form.get('battery_charge_power_kw','30'))))
@@ -605,14 +629,18 @@ def _write_passive_targets(c,pre):
     discharge_attrs=(states.get(ce['discharge_power'],{}).get('attributes') or {})
     discharge_hw_min=abs(float(discharge_attrs.get('min',discharge_attrs.get('min_value',discharge_attrs.get('native_min_value',0)))))
     reserve=float(st.get('battery_reserve_percent',25)); soc=sensors['battery_soc']
-    discharge_cap=min(float(st.get('battery_discharge_power_kw',30))*1000/inverter_count,discharge_hw_min) if soc>reserve else 0
+    # This is a power ceiling, not an instruction to discharge continuously.
+    # Keep the requested per-inverter limit available down to the inverter's own
+    # configured hard SoC floor; the Sofar/BMS, not this cap, enforces that floor.
+    discharge_cap=min(float(st.get('battery_discharge_power_kw',30))*1000/inverter_count,discharge_hw_min)
     # Passive mode uses positive battery watts for charging and negative for discharge.
     _control_call('number','set_value',ce['grid_setpoint'],{'value':0})
     _control_call('number','set_value',ce['charge_power'],{'value':int(charge_cap//100*100)})
     _control_call('number','set_value',ce['discharge_power'],{'value':-int(discharge_cap//100*100)})
     _control_call('button','press',ce['apply_button'])
     return {'charge_power_per_inverter_w':int(charge_cap//100*100),
-            'discharge_power_limit_per_inverter_w':-int(discharge_cap//100*100)}
+            'discharge_power_limit_per_inverter_w':-int(discharge_cap//100*100),
+            'hardware_min_soc_percent':float(st.get('battery_hard_min_percent',20))}
 
 def _restore_control_mode():
     try: previous=json.loads(CONTROL_STATE_FILE.read_text()).get('previous_mode')
@@ -714,7 +742,7 @@ def consumers():
   sensors=request.form.getlist('consumer_pressure_sensor'); pmins=request.form.getlist('consumer_pressure_min'); pmaxs=request.form.getlist('consumer_pressure_max')
   volumes=request.form.getlist('consumer_receiver_volume'); onbars=request.form.getlist('consumer_on_bar'); offbars=request.form.getlist('consumer_off_bar')
   leakflags=request.form.getlist('consumer_leak_monitor'); states=request.form.getlist('consumer_state_sensor')
-  temps=request.form.getlist('consumer_temperature_sensor'); targets=request.form.getlist('consumer_target_temperature')
+  temps=request.form.getlist('consumer_temperature_sensor'); targets=request.form.getlist('consumer_target_temperature'); power_sensors=request.form.getlist('consumer_current_power_sensor'); runtimes=request.form.getlist('consumer_plan_runtime')
   for i,x in enumerate(c.get('consumers',[])):
    x.setdefault('id','consumer_'+str(i)); x['name']=(names[i].strip() if i<len(names) else x.get('name','Verbraucher')) or x.get('name','Verbraucher')
    x['type']=types[i] if i<len(types) and types[i] in valid_types else x.get('type','custom')
@@ -753,6 +781,8 @@ def consumers():
     x['leak_monitor_enabled']=str(x['id']) in request.form.getlist('consumer_leak_monitor')
    # For other consumer types, retain any stored compressor-specific setting.
    x['compressor_state_entity']=valid_entity(states[i] if i<len(states) else x.get('compressor_state_entity',''))
+   x['current_power_sensor_entity']=valid_entity(power_sensors[i] if i<len(power_sensors) else x.get('current_power_sensor_entity',''))
+   x['plan_runtime_minutes']=num(runtimes[i] if i<len(runtimes) else x.get('plan_runtime_minutes',60),60,15,720)
    x['temperature_sensor_entity']=valid_entity(temps[i] if i<len(temps) else x.get('temperature_sensor_entity',''))
    try:x['target_temperature_c']=max(-20.0,min(100.0,float(targets[i]))) if i<len(targets) and targets[i].strip() else x.get('target_temperature_c',20.0)
    except ValueError:x['target_temperature_c']=20.0
@@ -773,7 +803,8 @@ def consumers():
     'compressor_state_entity':request.form.get('new_state_sensor','').strip(),
     'surplus_pulse_enabled':False,'surplus_start_button_entity':'','surplus_start_power_w':power,
     'temperature_sensor_entity':request.form.get('new_temperature_sensor','').strip(),
-    'target_temperature_c':max(-20.0,min(100.0,float(request.form.get('new_target_temperature','20') or 20)))})
+    'current_power_sensor_entity':'',
+    'target_temperature_c':max(-20.0,min(100.0,float(request.form.get('new_target_temperature','20') or 20))),'plan_runtime_minutes':num(request.form.get('new_plan_runtime','60'),60,15,720)})
   c['settings']['consumer_dispatch_enabled']=request.form.get('consumer_dispatch_enabled')=='on'
   c['settings']['consumer_pcc_aggregate_confirmed']=request.form.get('consumer_pcc_aggregate_confirmed')=='on'
   c['settings']['consumer_dispatch_sustain_seconds']=num(request.form.get('consumer_dispatch_sustain_seconds','120'),120,30,900)
@@ -822,6 +853,7 @@ def consumer_dispatch_tick():
         elif soc is None or float(soc)<reserve: reason=f'SoC fehlt/veraltet oder unter Reserve ({reserve:.0f} %)'
         elif raw_batt is None: reason='Batterieleistung fehlt/veraltet'
         elif not charging and float(soc)<99: reason='Batterie hat Vorrang: sie lädt noch nicht'
+        elif float(soc)<99 and not get_day_ahead_plan(snap).get('battery_target_reachable',False): reason='Überschuss reicht laut Abendplan voraussichtlich nicht für das volle Speicherziel; Impuls gesperrt.'
         else:
             required=max(0,float(x.get('surplus_start_power_w',x.get('nominal_power_w',0))))+margin
             if export_w<required:
@@ -1321,10 +1353,32 @@ def api_energy_brain_explain():
         answer += f" Netzbezugsgrenze laut Konfiguration: {rec.get('grid_import_limit_w','unbekannt')} W. Sie ist ein Zielwert und keine harte Abschaltung."
         if config().get('settings',{}).get('grid_import_sign','unverified')=='unverified':
             answer += ' Das Vorzeichen des Netzsensors ist noch nicht bestätigt; deshalb wird kein Netzbezug aus dem Messwert abgeleitet.'
+        plan=get_day_ahead_plan(); imports=[x for x in plan.get('steps',[]) if float(x.get('grid_import_w',0) or 0)>100]
+        if imports:
+            answer += f" Im Schattenplan werden etwa {plan.get('expected_grid_import_kwh',0):.2f} kWh Netzbezug ab {datetime.fromisoformat(imports[0]['time']).astimezone().strftime('%H:%M')} erwartet, nachdem die verfügbare Batterieenergie die Hardware-Untergrenze erreicht. Das versorgt den Hausverbrauch; Netzladung des Speichers wird nicht angenommen."
+        elif plan.get('steps'):
+            answer += ' Im aktuellen Schattenplan wird bis zur Planungsfrist kein zusätzlicher Netzbezug vorhergesagt.'
     if any(word in q for word in ('speicher','batterie','akku','reserve')):
-        answer += ' Eine konkrete Lade- oder Entladevorgabe wird derzeit nicht berechnet, weil SoC, Batterie-Leistungsgrenzen, Reserve und geprüfte Register gemeinsam bewertet werden müssen. Es werden keine Wechselrichterbefehle gesendet.'
+        plan=get_day_ahead_plan()
+        answer += (f" Aktueller SoC: {plan.get('battery_soc_percent','unbekannt')} %. Hardware-Untergrenze: {plan.get('hard_min_soc_percent','unbekannt')} %. "
+            f"Prognose zum Planungsende: {plan.get('predicted_soc_at_deadline_percent','unbekannt')} %. "
+            + ('Die Speicherladung hat Vorrang; geplante Verbraucher werden nur freigegeben, wenn das Abendziel in einer Neuberechnung erreichbar bleibt. ' if plan.get('phase')=='pv_to_evening' else 'In der Nachtprognose wird der Speicher bis zur Hardware-Untergrenze genutzt. ')
+            + 'Der aktive Entladeleistungswert ist eine Obergrenze, keine erzwungene Dauerentladung; die Sofar/BMS-Untergrenze muss passend eingestellt sein.')
     if any(word in q for word in ('pv','solar','sonne')):
         answer += f" Verwendete Momentanwerte: PV {rec.get('current_pv_w','unbekannt')} W, Hauslast {rec.get('current_load_w','unbekannt')} W. Das ist eine Momentaufnahme, keine Tagesprognose."
+        plan=get_day_ahead_plan()
+        answer += f" Der Schattenplan schätzt noch {plan.get('forecast_remaining_kwh','unbekannt')} kWh PV bis zur Planungsfrist (Quelle: {plan.get('forecast_source','nicht verfügbar')})."
+    if any(word in q for word in ('heizung','verbraucher','stufe','kompressor')):
+        plan=get_day_ahead_plan(); windows=plan.get('consumer_windows') or []
+        if windows:
+            answer += ' Mögliche Überschussfenster: '+'; '.join(f"{x.get('name')} {x.get('power_w')} W ab {datetime.fromisoformat(x.get('start')).astimezone().strftime('%H:%M')} bis {datetime.fromisoformat(x.get('end')).astimezone().strftime('%H:%M')}" for x in windows[:5])+'.'
+        elif plan.get('phase')=='pv_to_evening' and not plan.get('battery_target_reachable'):
+            answer += ' Es ist derzeit kein Zusatzverbrauch geplant, weil die konservative Batterie-only-Rechnung das Abendziel nicht erreicht.'
+        if plan.get('consumer_blocks'): answer += ' Verbraucher-Sperrgründe: '+'; '.join(plan['consumer_blocks'])+'.'
+        answer += ' Zeitfenster sind nur ein Schattenvorschlag. HA-Impulse starten die bestehende Automation nur nach stabil gemessenem Überschuss.'
+    if any(word in q for word in ('steuerung','regler','passivmodus')):
+        runtime=CONTROL_RUNTIME
+        answer += f" Speicherreglerstatus: {runtime.get('status','unbekannt')}. Steuerung in der Konfiguration {'aktiviert' if config().get('settings',{}).get('control_enabled') else 'ausgeschaltet'}. Der Watchdog ist die Rückfallebene; die Energieplanung selbst sendet keine zukünftigen Befehle."
     return jsonify({'question':question,'answer':answer,'mode':'lokal · regelbasiert und messwertgestützt','commands_sent':False})
 
 @app.route('/api/learned-load-patterns')
@@ -1503,6 +1557,471 @@ def api_consumer_plan():
         'warning': ('Netzleistungs-Vorzeichen erst in der Konfiguration bestätigen.' if export_w is None else
                     'Nur Vorschlag: keine Verbraucher werden geschaltet. Vor dem Betrieb Anlaufstrom, Mindestlaufzeiten und Verriegelungen berücksichtigen.')
     })
+
+
+def _plan_timestamp(value):
+    try:
+        dt=datetime.fromisoformat(str(value).replace('Z','+00:00'))
+        return dt.astimezone() if dt.tzinfo else dt.astimezone()
+    except (TypeError,ValueError,OverflowError):
+        return None
+
+def _plan_number(item, max_age=180):
+    if not isinstance(item,dict): return None
+    try:
+        value=float(item.get('value')); updated=_plan_timestamp(item.get('updated'))
+        if not math.isfinite(value) or updated is None or (datetime.now().astimezone()-updated).total_seconds()>max_age: return None
+        return value
+    except (TypeError,ValueError,OverflowError): return None
+
+def _day_ahead_profiles(c, rows, now):
+    """Build robust 15-minute median profiles from per-day local history."""
+    consumer_ids=[str(x.get('id','')) for x in c.get('consumers',[]) if x.get('enabled')]
+    load_days={}; pv_days={}; consumer_days={cid:{} for cid in consumer_ids}
+    cutoff=now-timedelta(days=21)
+    for row in rows:
+        dt=_plan_timestamp(row.get('timestamp'))
+        if dt is None or dt<cutoff: continue
+        slot=dt.hour*4+dt.minute//15; day=dt.date().isoformat()
+        values=row.get('values') or {}; cv_all=row.get('consumer_values') or {}
+        try: load=float(values.get('load_power'))
+        except (TypeError,ValueError): load=None
+        try: pv=float(values.get('pv_power'))
+        except (TypeError,ValueError): pv=None
+        measured_consumers={}
+        for cid in consumer_ids:
+            item=(cv_all.get(cid) or {}).get('current_power_sensor_entity')
+            try:
+                power=max(0.0,float(item)) if item is not None else None
+                if power is not None:
+                    measured_consumers[cid]=power
+                    consumer_days[cid].setdefault((day,slot),[]).append(power)
+            except (TypeError,ValueError): pass
+        if load is not None and math.isfinite(load) and 0<=load<=250000:
+            base=max(0.0,load-sum(measured_consumers.values()))
+            load_days.setdefault((day,slot),[]).append(base)
+        if pv is not None and math.isfinite(pv) and 0<=pv<=250000:
+            pv_days.setdefault((day,slot),[]).append(pv)
+    def collapse(source):
+        per_day={}
+        for (day,slot),values in source.items():
+            if values: per_day.setdefault(slot,[]).append(statistics.median(values))
+        return {slot:statistics.median(values) for slot,values in per_day.items() if values}
+    load_profile=collapse(load_days); pv_profile=collapse(pv_days)
+    consumer_profiles={cid:collapse(samples) for cid,samples in consumer_days.items()}
+    profile_days=len({day for day,_ in list(load_days.keys())+list(pv_days.keys())})
+    return load_profile,pv_profile,consumer_profiles,profile_days
+
+def _solcast_interval_forecast(item, now, end):
+    """Read Solcast-style per-period energy from HA sensor attributes when exposed."""
+    attrs=(item or {}).get('attributes') or {}
+    candidates=('detailedForecast','detailed_forecast','forecast','hourly_forecast','forecast_today','raw_forecasts')
+    points=None
+    for key in candidates:
+        value=attrs.get(key)
+        if isinstance(value,list) and value and any(isinstance(x,dict) for x in value):
+            points=value; break
+    if not points: return {}
+    parsed=[]
+    for point in points:
+        if not isinstance(point,dict): continue
+        start=_plan_timestamp(point.get('period') or point.get('start') or point.get('datetime') or point.get('time'))
+        if start is None: continue
+        field=next((key for key in ('pv_estimate10','pv_estimate','energy_kwh','energy','pv_energy','power_w','power_kw') if point.get(key) is not None),None)
+        if not field: continue
+        try: value=max(0.0,float(point[field]))
+        except (TypeError,ValueError): continue
+        parsed.append((start,value,field))
+    parsed.sort(key=lambda x:x[0])
+    if not parsed: return {}
+    result={}; default_unit=str((item or {}).get('unit','')).lower()
+    for i,(start,value,field) in enumerate(parsed):
+        next_start=parsed[i+1][0] if i+1<len(parsed) else start+timedelta(minutes=30)
+        duration=max(5.0,min(120.0,(next_start-start).total_seconds()/60.0))
+        if field in ('power_w','power_kw'):
+            power=value*(1000.0 if field=='power_kw' else 1.0)
+            energy_kwh=power*duration/60000.0
+        else:
+            energy_kwh=value
+            if field in ('energy','pv_energy') and ('wh' in default_unit and 'kwh' not in default_unit): energy_kwh/=1000.0
+            elif energy_kwh>1000: energy_kwh/=1000.0
+        slot_start=max(start,now); slot_end=min(start+timedelta(minutes=duration),end)
+        if slot_end<=slot_start: continue
+        full_seconds=max(1.0,(start+timedelta(minutes=duration)-start).total_seconds())
+        span_seconds=(slot_end-slot_start).total_seconds()
+        cursor=slot_start
+        while cursor<slot_end:
+            quarter=cursor.replace(minute=(cursor.minute//15)*15,second=0,microsecond=0)
+            qend=quarter+timedelta(minutes=15); overlap=max(0.0,(min(qend,slot_end)-cursor).total_seconds())
+            key=quarter.isoformat(); result[key]=result.get(key,0.0)+energy_kwh*overlap/full_seconds
+            cursor=min(qend,slot_end)
+    return result
+
+def _simulate_plan_battery(slots, start_kwh, capacity_kwh, floor_kwh, charge_cap_w, discharge_cap_w, charge_eff, discharge_eff):
+    energy=max(0.0,min(capacity_kwh,start_kwh)); result=[]
+    for slot in slots:
+        hours=float(slot.get('minutes',15))/60.0
+        pv=max(0.0,float(slot.get('pv_w',0))); load=max(0.0,float(slot.get('load_w',0)))+max(0.0,float(slot.get('planned_consumer_w',0)))
+        net=pv-load; charge=discharge=grid_import=grid_export=0.0
+        if net>=0:
+            charge=min(net,charge_cap_w,max(0.0,(capacity_kwh-energy)*1000/max(0.01,hours*charge_eff)))
+            energy=min(capacity_kwh,energy+charge*hours*charge_eff/1000.0)
+            grid_export=max(0.0,net-charge)
+        else:
+            deficit=-net
+            permitted_discharge=min(discharge_cap_w,max(0.0,float(slot.get('discharge_cap_w',discharge_cap_w))))
+            discharge=min(deficit,permitted_discharge,max(0.0,(energy-floor_kwh)*1000*discharge_eff/max(0.01,hours)))
+            if energy>=floor_kwh: energy=max(floor_kwh,energy-discharge*hours/max(0.01,1000*discharge_eff))
+            grid_import=max(0.0,deficit-discharge)
+        result.append({**slot,'pv_w':round(pv),'load_w':round(load),'battery_charge_w':round(charge),
+            'battery_discharge_w':round(discharge),'grid_import_w':round(grid_import),'grid_export_w':round(grid_export),
+            'soc_percent':round(energy/capacity_kwh*100.0,1) if capacity_kwh else None,
+            'energy_kwh':round(energy,4)})
+    return result
+
+def build_day_ahead_plan(c=None, rows=None, snap=None):
+    """15-minute shadow plan to the next relevant evening or morning boundary.
+    Grid energy in this forecast covers the house after the battery reaches its
+    configured hard floor; it never models grid-to-battery charging.
+    """
+    c=c or config(); st=c.get('settings',{}); snap=snap or snapshot(); rows=rows if rows is not None else learning_rows(limit=100000)
+    now=datetime.now().astimezone(); values=snap.get('values',{})
+    night_start=max(0,min(23,int(st.get('night_start_hour',18)))); morning_start=max(0,min(23,int(st.get('morning_start_hour',5))))
+    today_deadline=now.replace(hour=night_start,minute=0,second=0,microsecond=0)
+    if today_deadline<=now:
+        next_morning=now.replace(hour=morning_start,minute=0,second=0,microsecond=0)
+        if next_morning<=now: next_morning+=timedelta(days=1)
+        end=next_morning; phase='night'; charge_deadline=None
+    else:
+        end=today_deadline; phase='pv_to_evening'; charge_deadline=today_deadline
+    boundaries=[]; cursor=now
+    while cursor<end and len(boundaries)<120:
+        next_quarter=cursor.replace(minute=(cursor.minute//15)*15,second=0,microsecond=0)+timedelta(minutes=15)
+        step_end=min(end,next_quarter)
+        minutes=max(0.1,(step_end-cursor).total_seconds()/60.0)
+        boundaries.append((cursor,minutes)); cursor=step_end
+    capacity=max(1.0,float(st.get('battery_capacity_kwh',80)))
+    hard_min=max(0.0,min(95.0,float(st.get('battery_hard_min_percent',20))))
+    floor_kwh=capacity*hard_min/100.0
+    reserve_pct=max(hard_min,min(100.0,float(st.get('battery_reserve_percent',hard_min))))
+    reserve_kwh=capacity*reserve_pct/100.0
+    soc=_plan_number(values.get('battery_soc'),180)
+    start_kwh=capacity*max(0.0,min(100.0,soc or 0.0))/100.0 if soc is not None else None
+    charge_cap=max(0.0,float(st.get('battery_charge_power_kw',30)))*1000.0
+    discharge_cap=max(0.0,float(st.get('battery_discharge_power_kw',30)))*1000.0
+    eff=max(0.5,min(1.0,float(st.get('battery_roundtrip_efficiency',0.90) or 0.90)))
+    charge_eff=discharge_eff=math.sqrt(eff)
+    load_profile,pv_profile,consumer_profiles,profile_days=_day_ahead_profiles(c,rows,now)
+    current_load=_plan_number(values.get('load_power'),180)
+    current_pv=_plan_number(values.get('pv_power'),180)
+    # Remove measured configured consumer power from the live load so the plan can
+    # represent consumer stages separately instead of counting them twice.
+    current_consumers={}; known_current_consumer_w=0.0
+    for consumer in c.get('consumers',[]):
+        cid=str(consumer.get('id','')); cv=(snap.get('consumer_values',{}).get(cid,{}) or {})
+        item=cv.get('current_power_sensor_entity') or {}; value=_plan_number(item,180)
+        if value is not None and 'kw' in str(item.get('unit','')).lower(): value*=1000
+        current_consumers[cid]=value
+        if value is not None: known_current_consumer_w+=max(0.0,value)
+    current_base=max(0.0,(current_load or 0.0)-known_current_consumer_w) if current_load is not None else None
+    today_pv_kwh=0.0; today=now.date().isoformat(); same_day=[]
+    for row in rows:
+        dt=_plan_timestamp(row.get('timestamp'))
+        if dt is not None and dt.date().isoformat()==today:
+            try:
+                p=row.get('values',{}).get('pv_power')
+                if isinstance(p,(int,float)) and math.isfinite(float(p)): same_day.append((dt.timestamp(),float(p)))
+            except (TypeError,ValueError): pass
+    same_day.sort()
+    for (t0,p0),(t1,p1) in zip(same_day,same_day[1:]):
+        if 0<t1-t0<=120: today_pv_kwh+=max(0.0,p0+p1)*0.5*(t1-t0)/3600000.0
+    forecast_item=values.get('pv_forecast') or {}; forecast_value=_plan_number(forecast_item,3600)
+    forecast_unit=str(forecast_item.get('unit') or c.get('sensors',{}).get('pv_forecast',{}).get('unit','')).lower()
+    forecast_kwh=(forecast_value/1000.0 if forecast_value is not None and 'wh' in forecast_unit and 'kwh' not in forecast_unit else forecast_value)
+    if forecast_kwh is not None and forecast_kwh<0: forecast_kwh=None
+    remaining_forecast=(max(0.0,forecast_kwh-today_pv_kwh) if st.get('pv_forecast_mode','daily_total')=='daily_total' else forecast_kwh) if forecast_kwh is not None else None
+    interval_forecast=_solcast_interval_forecast(forecast_item,now,end) if phase=='pv_to_evening' else {}
+    forecast_source='Solcast-Zeitfenster' if interval_forecast else 'Tageswert, zeitlich verteilt'
+    pv_weights={}
+    for dt,minutes in boundaries:
+        slot=dt.hour*4+dt.minute//15
+        key=dt.replace(minute=(dt.minute//15)*15,second=0,microsecond=0).isoformat()
+        if pv_profile.get(slot,0)>0: pv_weights[key]=max(0.0,pv_profile[slot])*minutes/15.0
+        else:
+            hour=dt.hour+dt.minute/60.0
+            pv_weights[key]=(max(0.0,math.sin(math.pi*(hour-6.0)/14.0))*minutes/15.0) if 6.0<hour<20.0 else 0.0
+    remaining_detailed=sum(interval_forecast.values())
+    if interval_forecast and remaining_detailed>0:
+        # Match the configured daily/remaining forecast total to the still-open periods.
+        scale=(remaining_forecast/remaining_detailed) if remaining_forecast is not None and remaining_detailed>0 else 1.0
+        pv_energy={key:max(0.0,value*scale) for key,value in interval_forecast.items()}
+    elif remaining_forecast is not None and pv_weights and sum(pv_weights.values())>0:
+        # Daily totals alone contain no time-of-day information. Use recent plant shape
+        # when available, otherwise a broad daylight curve; keep this visibly provisional.
+        pv_energy={key:remaining_forecast*0.80*weight/sum(pv_weights.values()) for key,weight in pv_weights.items()}
+    else: pv_energy={}
+    if phase=='pv_to_evening' and remaining_forecast is None:
+        forecast_source='PV-Prognose fehlt'
+    elif phase=='pv_to_evening' and not interval_forecast and profile_days<3:
+        forecast_source='Grobe Tageskurve · zu wenig Profilhistorie'
+    night_discharge={}; night_days={}
+    sign=st.get('battery_power_sign','negative')
+    if phase=='night':
+        remaining_forecast=None
+        forecast_source='Nachtphase · PV nicht angesetzt'
+        for row in rows:
+            dt=_plan_timestamp(row.get('timestamp'))
+            if dt is None or (now-dt).days>21: continue
+            try:
+                raw=float(row.get('values',{}).get('battery_power')); value=max(0.0,-raw if sign=='negative' else raw)
+                slot=dt.hour*4+dt.minute//15
+                night_days.setdefault((slot,dt.date().isoformat()),[]).append(value)
+            except (TypeError,ValueError): continue
+        by_slot={}
+        for (slot,day),points in night_days.items(): by_slot.setdefault(slot,[]).append(statistics.median(points))
+        night_discharge={slot:statistics.median(points) for slot,points in by_slot.items() if len(points)>=3}
+    external_profiles={}; consumer_map={str(x.get('id','')):x for x in c.get('consumers',[]) if x.get('enabled')}
+    for cid,consumer in consumer_map.items():
+        if consumer.get('management_mode')=='external': external_profiles[cid]=consumer_profiles.get(cid,{})
+    slots=[]
+    for dt,minutes in boundaries:
+        slot=dt.hour*4+dt.minute//15; key=dt.replace(minute=(dt.minute//15)*15,second=0,microsecond=0).isoformat()
+        if phase=='pv_to_evening' and dt<end:
+            pv_w=min(max(1.0,float(st.get('pv_peak_power_kw',50)))*1000.0,max(0.0,pv_energy.get(key,0.0))*60000.0/minutes)
+            if current_pv is not None and dt<=now+timedelta(minutes=15): pv_w=max(pv_w,current_pv)
+        else: pv_w=0.0
+        base_w=load_profile.get(slot)
+        if base_w is None: base_w=current_base if current_base is not None else current_load
+        if base_w is None: base_w=0.0
+        # Model measured external loads from their learned 15-minute profiles. If no
+        # profile exists, use the current measured stage only while its state is on.
+        external_w=0.0
+        for cid,consumer in external_profiles.items():
+            profile=external_profiles[cid].get(slot)
+            state=((snap.get('consumer_values',{}).get(cid,{}) or {}).get('compressor_state_entity') or {}).get('state','')
+            active=str(state).strip().lower() in ('on','true','1','running','heat','heating')
+            if profile is not None: external_w+=max(0.0,profile)
+            elif active: external_w+=max(0.0,current_consumers.get(cid) or float(consumer.get('external_reserve_power_w',consumer.get('nominal_power_w',0)) or 0))
+        if phase=='night':
+            pv_w=0.0
+            load_w=max(0.0,base_w+external_w)
+        else: load_w=max(0.0,base_w+external_w)
+        slots.append({'time':dt.isoformat(),'minutes':minutes,'pv_w':pv_w,'load_w':load_w,'planned_consumer_w':0.0,
+            'slot':slot,'phase':phase,'discharge_cap_w':min(discharge_cap,night_discharge.get(slot,discharge_cap)) if phase=='night' else discharge_cap})
+    if soc is None:
+        return {'timestamp':now.isoformat(),'mode':'shadow','commands_sent':False,'status':'SoC fehlt oder ist veraltet',
+            'phase':phase,'charge_deadline':charge_deadline.isoformat() if charge_deadline else None,'hard_min_soc_percent':hard_min,
+            'reserve_soc_percent':reserve_pct,'steps':[],'consumer_windows':[],'limitations':['Ohne frischen Batterie-SoC ist keine Speicher- oder Netzprognose möglich.']}
+    baseline=_simulate_plan_battery(slots,start_kwh,capacity,floor_kwh,charge_cap,discharge_cap,charge_eff,discharge_eff)
+    deadline_index=len(baseline)-1
+    if charge_deadline:
+        deadline_index=next((i for i,x in enumerate(baseline) if _plan_timestamp(x['time'])>=charge_deadline),len(baseline)-1)
+        deadline_index=max(0,min(len(baseline)-1,deadline_index))
+    target_kwh=capacity*(0.99 if charge_deadline else reserve_pct/100.0)
+    baseline_deadline_kwh=(baseline[deadline_index]['energy_kwh'] if baseline else start_kwh)
+    full_reachable=bool(charge_deadline and baseline_deadline_kwh>=capacity*0.985)
+    consumer_windows=[]; scheduled=[]; notes=[]; consumer_blocks=[]
+    if phase=='pv_to_evening' and charge_deadline:
+        if remaining_forecast is None: notes.append('Kein aktueller PV-Prognosesensorwert; Verbraucherplanung bleibt gesperrt.')
+        elif not full_reachable: notes.append('Die vorsichtige Batterie-only-Prognose erreicht bis zur Abendfrist keine volle Batterie; Speicher hat Vorrang, daher keine geplanten Zusatzverbraucher.')
+        else:
+            # Shadow opportunities are limited to configured discrete steps and are
+            # admitted only when a conservative full-day re-simulation still reaches 98.5%.
+            discretionary=sorted((x for x in consumer_map.values() if x.get('enabled')),key=lambda x:int(x.get('priority',99)))
+            for i,slot in enumerate(slots):
+                dt=_plan_timestamp(slot['time'])
+                if dt is None or dt>=charge_deadline: continue
+                baseline_charge=baseline[i]['battery_charge_w'] if i<len(baseline) else 0
+                local_left=max(0.0,slot['pv_w']-slot['load_w']-slot.get('planned_consumer_w',0)-baseline_charge-float(st.get('consumer_surplus_margin_w',1000)))
+                if local_left<500: continue
+                for consumer in discretionary:
+                    cid=str(consumer.get('id','')); current=current_consumers.get(cid)
+                    if any(x.get('consumer_id')==cid and _plan_timestamp(x.get('start'))<=dt<_plan_timestamp(x.get('end')) for x in scheduled):
+                        continue
+                    status=((snap.get('consumer_values',{}).get(cid,{}) or {}).get('compressor_state_entity') or {}).get('state','')
+                    active=str(status).strip().lower() in ('on','true','1','running','heat','heating')
+                    if active: continue
+                    if consumer.get('management_mode')=='external' and str(status).strip().lower() not in ('off','false','0'):
+                        message=f"{consumer.get('name','Verbraucher')}: externer Status fehlt oder ist nicht eindeutig AUS"
+                        if message not in consumer_blocks: consumer_blocks.append(message)
+                        continue
+                    cv=(snap.get('consumer_values',{}).get(cid,{}) or {})
+                    temp_entity=consumer.get('temperature_sensor_entity','')
+                    if temp_entity and consumer.get('type') in ('heater','heat_pump'):
+                        temperature=_plan_number(cv.get('temperature_sensor_entity'),180)
+                        target_temp=float(consumer.get('target_temperature_c',20.0))
+                        if temperature is None or temperature>=target_temp:
+                            message=f"{consumer.get('name','Verbraucher')}: Temperatur fehlt/veraltet oder Ziel bereits erreicht"
+                            if message not in consumer_blocks: consumer_blocks.append(message)
+                            continue
+                    pressure_entity=consumer.get('pressure_sensor_entity','')
+                    if pressure_entity and consumer.get('type')=='motor':
+                        pressure=_plan_number(cv.get('pressure_sensor_entity'),180)
+                        if pressure is None or pressure>=float(consumer.get('compressor_on_bar',6.0)):
+                            message=f"{consumer.get('name','Verbraucher')}: Drucksensor sperrt den Start oder ist nicht verfügbar"
+                            if message not in consumer_blocks: consumer_blocks.append(message)
+                            continue
+                    stages=sorted({int(v) for v in consumer.get('stages_w',[]) if int(v)>0})
+                    if not stages:
+                        nominal=int(consumer.get('nominal_power_w',0) or 0); stages=[nominal] if nominal>0 else []
+                    duration=max(15,min(720,int(consumer.get('plan_runtime_minutes',60) or 60)))
+                    if dt+timedelta(minutes=duration)>end:
+                        message=f"{consumer.get('name','Verbraucher')}: angenommene Laufzeit reicht über die Planungsfrist hinaus"
+                        if message not in consumer_blocks: consumer_blocks.append(message)
+                        continue
+                    candidates=[x for x in stages if x<=local_left]
+                    for stage in reversed(candidates):
+                        test=[dict(x) for x in slots]
+                        run_end=dt+timedelta(minutes=duration)
+                        for j in range(i,len(test)):
+                            step_start=_plan_timestamp(test[j]['time']); step_end=step_start+timedelta(minutes=float(test[j].get('minutes',15)))
+                            overlap=max(0.0,(min(step_end,run_end)-max(step_start,dt)).total_seconds()/60.0)
+                            if overlap>0: test[j]['planned_consumer_w']+=stage*overlap/max(0.1,float(test[j].get('minutes',15)))
+                        trial=_simulate_plan_battery(test,start_kwh,capacity,floor_kwh,charge_cap,discharge_cap,charge_eff,discharge_eff)
+                        trial_kwh=trial[deadline_index]['energy_kwh'] if trial else start_kwh
+                        if trial_kwh>=capacity*0.985:
+                            for j in range(i,len(slots)):
+                                step_start=_plan_timestamp(slots[j]['time']); step_end=step_start+timedelta(minutes=float(slots[j].get('minutes',15)))
+                                overlap=max(0.0,(min(step_end,run_end)-max(step_start,dt)).total_seconds()/60.0)
+                                if overlap>0: slots[j]['planned_consumer_w']+=stage*overlap/max(0.1,float(slots[j].get('minutes',15)))
+                            scheduled.append({'consumer_id':cid,'name':consumer.get('name','Verbraucher'),'start':slot['time'],
+                                'end':(dt+timedelta(minutes=duration)).isoformat(),'power_w':stage,'duration_minutes':duration,
+                                'management':consumer.get('management_mode','advisory'),'button_configured':bool(consumer.get('surplus_start_button_entity')),
+                                'reason':f'{stage} W passen in das lokale PV-Fenster; Batterie-only-Ziel bleibt nach Neuberechnung bei mindestens 98,5 %.'})
+                            break
+                    if scheduled and scheduled[-1].get('start')==slot['time']:
+                        break
+            if not scheduled: notes.append('Batterie kann voraussichtlich voll werden; in den geprüften 15-Minuten-Fenstern reicht der zusätzliche Überschuss nicht sicher für eine konfigurierte Stufe.')
+    final=_simulate_plan_battery(slots,start_kwh,capacity,floor_kwh,charge_cap,discharge_cap,charge_eff,discharge_eff)
+    if charge_deadline and final:
+        predicted_deadline=final[deadline_index]['energy_kwh']; target_reached=predicted_deadline>=capacity*0.985
+    else:
+        predicted_deadline=final[-1]['energy_kwh'] if final else start_kwh
+        target_reached=False
+    # Group adjacent consumer windows with the same stage so the UI shows time ranges.
+    grouped=[]
+    for item in scheduled:
+        if grouped and grouped[-1]['consumer_id']==item['consumer_id'] and grouped[-1]['power_w']==item['power_w'] and _plan_timestamp(item['start'])<=_plan_timestamp(grouped[-1]['end'])+timedelta(minutes=15):
+            grouped[-1]['end']=item['end']; grouped[-1]['duration_minutes']+=item['duration_minutes']
+        else: grouped.append(dict(item))
+    grid_energy=sum(x['grid_import_w']*float(x.get('minutes',15))/60000.0 for x in final)
+    export_energy=sum(x['grid_export_w']*float(x.get('minutes',15))/60000.0 for x in final)
+    if consumer_blocks: notes.append('Verbraucherprüfung: '+'; '.join(consumer_blocks)+'.')
+    return {'timestamp':now.isoformat(),'mode':'shadow','commands_sent':False,'phase':phase,
+        'status':'Plan vorläufig' if remaining_forecast is None or profile_days<3 else '15-Minuten-Schattenplan',
+        'forecast_source':forecast_source,'forecast_remaining_kwh':round(remaining_forecast,2) if remaining_forecast is not None else None,
+        'forecast_safety_factor':0.80 if not interval_forecast and phase=='pv_to_evening' else 1.0,
+        'profile_days':profile_days,'load_profile_slots':len(load_profile),'pv_profile_slots':len(pv_profile),
+        'battery_soc_percent':round(soc,1),'predicted_soc_at_deadline_percent':round(predicted_deadline/capacity*100,1) if capacity else None,
+        'battery_target_soc_percent':99 if charge_deadline else round(reserve_pct,1),'battery_target_reachable':target_reached,
+        'battery_only_soc_at_deadline_percent':round(baseline_deadline_kwh/capacity*100,1) if capacity else None,
+        'charge_deadline':charge_deadline.isoformat() if charge_deadline else None,'horizon_end':end.isoformat(),
+        'hard_min_soc_percent':hard_min,'strategic_reserve_percent':reserve_pct,
+        'expected_grid_import_kwh':round(grid_energy,2),'expected_grid_export_kwh':round(export_energy,2),
+        'consumer_windows':grouped,'consumer_blocks':consumer_blocks,'steps':final,'notes':notes,
+        'limitations':['Beobachtungsplan: keine Netzladung und keine Verbraucher-/Wechselrichterbefehle werden aus dieser Planung gesendet.',
+          'Solcast-Tagesgesamtwerte enthalten keine Uhrzeiten; ohne Zeitfensterattribute werden sie anhand eines groben bzw. gelernten PV-Tagesprofils verteilt.',
+          'Zusätzliche Verbraucher werden nur eingeplant, wenn eine konservative Neuberechnung das Abendziel von mindestens 98,5 % SoC weiter erreicht.',
+          'HA-Impulse können nur eine vorhandene Automation starten. Laufzeit, Abschaltung und Heizstufen müssen in Home Assistant passend begrenzt sein.',
+          'Netzbezug in der Prognose versorgt den Hausverbrauch, sobald die Batterie die konfigurierte Hardware-Untergrenze erreicht; es wird keine Batterie-Netzladung unterstellt.']}
+
+DAY_PLAN_CACHE={'key':None,'created':0.0,'result':None}; DAY_PLAN_CACHE_LOCK=threading.Lock()
+def get_day_ahead_plan(snap=None):
+    snap=snap or snapshot(); c=config(); now=time.time()
+    # The sampler appends every ten seconds. Key by bounded time and config
+    # instead of file mtime so a full profile rebuild does not happen per sample.
+    key=(CFG.stat().st_mtime_ns if CFG.exists() else 0,int(now//300))
+    with DAY_PLAN_CACHE_LOCK:
+        if DAY_PLAN_CACHE['result'] is not None and DAY_PLAN_CACHE.get('key')==key and now-DAY_PLAN_CACHE['created']<300:
+            return DAY_PLAN_CACHE['result']
+    result=build_day_ahead_plan(c,learning_rows(limit=100000),snap)
+    with DAY_PLAN_CACHE_LOCK: DAY_PLAN_CACHE.update(key=key,created=now,result=result)
+    return result
+
+@app.route('/api/day-plan')
+def api_day_plan():
+    return jsonify(get_day_ahead_plan())
+
+@app.route('/api/stage-optimizer')
+def api_stage_optimizer():
+    """First shadow-only stage-aware check; emits suggestions but never commands."""
+    c=config(); snap=snapshot(); vals=snap.get('values',{}); st=c.get('settings',{})
+    now=datetime.now().astimezone(); deadline_hour=max(0,min(23,int(st.get('night_start_hour',18))))
+    deadline=now.replace(hour=deadline_hour,minute=0,second=0,microsecond=0)
+    if deadline<=now: deadline+=timedelta(days=1)
+    hours_left=max(0.0,(deadline-now).total_seconds()/3600.0)
+    hard_min_soc=max(float(st.get('battery_hard_min_percent',20)),float(st.get('battery_reserve_percent',20)))
+    soc_item=vals.get('battery_soc') or {}; load_item=vals.get('load_power') or {}; grid_item=vals.get('grid_power') or {}; batt_item=vals.get('battery_power') or {}; forecast_item=vals.get('pv_forecast') or {}
+    def fresh(item,age=180):
+        try:
+            ts=datetime.fromisoformat(str(item.get('updated','')).replace('Z','+00:00')).timestamp()
+            value=float(item.get('value'))
+            return value if math.isfinite(value) and -10<=time.time()-ts<=age else None
+        except Exception:return None
+    soc=fresh(soc_item); soc=soc if soc is not None and 0<=soc<=100 else None
+    load=fresh(load_item); raw_grid=fresh(grid_item); raw_batt=fresh(batt_item); forecast=fresh(forecast_item,3600)
+    grid_sign=st.get('grid_import_sign','unverified'); battery_sign=st.get('battery_power_sign','negative')
+    grid_import=(raw_grid*(-1 if grid_sign=='negative' else 1) if raw_grid is not None and grid_sign in ('positive','negative') else None)
+    export_w=max(0.0,-grid_import) if grid_import is not None else None
+    discharge=(raw_batt*(-1 if battery_sign=='negative' else 1) if raw_batt is not None else None)
+    charge_w=max(0.0,-discharge) if discharge is not None else None
+    capacity=max(1.0,float(st.get('battery_capacity_kwh',80)))
+    battery_gap_kwh=max(0.0,(100.0-soc)*capacity/100.0) if soc is not None else None
+    forecast_kwh=None
+    if forecast is not None:
+        unit=str(forecast_item.get('unit') or c.get('sensors',{}).get('pv_forecast',{}).get('unit','')).lower()
+        forecast_kwh=forecast/1000.0 if 'wh' in unit and 'kwh' not in unit else forecast
+    today_pv_kwh=0.0
+    try:
+        day=now.date().isoformat(); pts=[]
+        for row in learning_rows(limit=100000):
+            ts=datetime.fromisoformat(row.get('timestamp','').replace('Z','+00:00')).timestamp()
+            if datetime.fromtimestamp(ts).astimezone().date().isoformat()==day: pts.append((ts,row.get('values',{}).get('pv_power')))
+        pts.sort(key=lambda p:p[0])
+        for (t0,p0),(t1,p1) in zip(pts,pts[1:]):
+            if 0<t1-t0<=120 and isinstance(p0,(int,float)) and isinstance(p1,(int,float)): today_pv_kwh+=max(0,(p0+p1)*0.5)*(t1-t0)/3600000
+    except Exception: pass
+    pv_remaining_kwh=(max(0.0,forecast_kwh-today_pv_kwh) if st.get('pv_forecast_mode','daily_total')=='daily_total' else forecast_kwh) if forecast_kwh is not None else None
+    heaters=sorted((x for x in c.get('consumers',[]) if x.get('enabled') and x.get('type')=='heater'),key=lambda x:int(x.get('priority',99)))
+    results=[]
+    known_heater_w=0.0
+    for x in heaters:
+        cv=(snap.get('consumer_values',{}).get(str(x.get('id','')),{}) or {})
+        item=cv.get('current_power_sensor_entity') or {}; current=fresh(item)
+        if current is not None:
+            unit=str(item.get('unit','')).lower()
+            if unit in ('kw','kilowatt','kilowatts'): current*=1000
+            known_heater_w+=max(0,current)
+        stages=sorted({int(v) for v in x.get('stages_w',[]) if int(v)>0})
+        status='prüfen'
+        if not stages: reason='Für die Heizung sind keine Leistungsstufen konfiguriert.'; nxt=None
+        elif current is None: reason='Leistungs-/Stufensensor fehlt oder ist veraltet; Ist-Stufe unbekannt.'; nxt=None
+        else:
+            current_stage=min([0]+stages,key=lambda v:abs(v-current))
+            nxt=next((v for v in stages if v>current_stage+max(300,current_stage*0.08)),None)
+            delta=(nxt-current_stage) if nxt is not None else 0
+            if nxt is None: reason='Heizung ist bereits auf der höchsten konfigurierten Stufe.'
+            elif hours_left<=0: reason='Planungsfenster bis zur Abend-Ladefrist ist abgelaufen.'
+            elif soc is None or soc<hard_min_soc: reason=f'SoC fehlt oder liegt unter der Mindestreserve von {hard_min_soc:.0f} %.'
+            elif pv_remaining_kwh is None: reason='PV-Restprognose fehlt; eine Stufenfreigabe wäre nicht belastbar.'
+            elif load is None: reason='Hausverbrauch fehlt oder ist veraltet.'
+            elif export_w is None: reason='Netzsensor oder bestätigtes Netz-Vorzeichen fehlt.'
+            elif charge_w is None: reason='Batterieleistung fehlt oder ist veraltet.'
+            elif charge_w<100 and soc<99: reason='Batterie lädt noch nicht; Speicher hat Vorrang.'
+            else:
+                base_load=max(0.0,load-max(0.0,current))
+                # Conservative remainder estimate: reserve 20% of forecast and add a 1 kW load margin.
+                usable_pv=max(0.0,pv_remaining_kwh*0.8-(base_load+1000)*hours_left/1000.0)
+                surplus_after_battery=usable_pv-battery_gap_kwh
+                pace_w=battery_gap_kwh*1000/hours_left if hours_left>0 and battery_gap_kwh is not None else 0
+                charge_after_step=max(0.0,charge_w-max(0.0,delta-export_w))
+                if export_w<delta+float(st.get('consumer_surplus_margin_w',1000)): reason=f'Aktueller Überschuss {export_w:.0f} W reicht nicht für den nächsten Schritt (+{delta} W) samt Sicherheitsabstand.'
+                elif surplus_after_battery<delta*0.25/1000.0: reason='Prognose lässt voraussichtlich zu wenig PV-Energie übrig, um Speicherziel und nächste Heizstufe zusammen zu decken.'
+                elif charge_after_step<pace_w and soc<99: reason=f'Der Schritt würde die nötige Speicher-Laderate von etwa {pace_w:.0f} W voraussichtlich unterschreiten.'
+                else:
+                    status='möglicher nächster Schritt'; reason=f'Schattenvorschlag: {current_stage} → {nxt} W für zunächst 15 Minuten prüfen. Batterie bleibt im Ladeplan vorrangig; noch kein Impuls.'
+        results.append({'id':x.get('id'),'name':x.get('name','Heizung'),'current_power_w':round(current) if current is not None else None,'next_stage_w':nxt,'status':status,'reason':reason})
+    return jsonify({'timestamp':now.isoformat(),'mode':'Schattenmodus','commands_sent':False,'deadline':deadline.isoformat(),'hours_until_deadline':round(hours_left,2),'soc_percent':soc,'minimum_soc_percent':hard_min_soc,'battery_gap_kwh':round(battery_gap_kwh,2) if battery_gap_kwh is not None else None,'pv_forecast_remaining_kwh':round(pv_remaining_kwh,2) if pv_remaining_kwh is not None else None,'grid_export_w':round(export_w) if export_w is not None else None,'battery_charge_w':round(charge_w) if charge_w is not None else None,'consumers':results,'note':'Einzelprüfung für den nächsten Heizungs-Schritt. Der vollständige 15-Minuten-Ablauf steht unter /api/day-plan; beide Ansichten bleiben im Schattenmodus.'})
 
 @app.route('/api/compressor-analysis')
 def api_compressor_analysis():
@@ -1787,6 +2306,30 @@ def api_optimizer_report():
     except Exception: pass
     return jsonify(build_daily_optimizer_report())
 
+@app.route('/api/optimizer-feedback',methods=['GET','POST'])
+def api_optimizer_feedback():
+    """Save a user suggestion locally for review by future optimizer versions."""
+    if request.method=='GET':
+        try:
+            entries=[json.loads(line) for line in OPTIMIZER_FEEDBACK_FILE.read_text(encoding='utf-8').splitlines()[-20:] if line.strip()]
+        except Exception: entries=[]
+        return jsonify({'suggestions':entries,'count':len(entries),'applied_automatically':False})
+    payload=request.get_json(silent=True) or {}
+    text=' '.join(str(payload.get('suggestion','')).split())[:1000]
+    if len(text)<3:
+        return jsonify({'ok':False,'message':'Bitte beschreibe den Vorschlag etwas genauer.'}),400
+    entry={'timestamp':datetime.now(timezone.utc).isoformat(),'kind':'user_suggestion','text':text,'applied':False}
+    with OPTIMIZER_FEEDBACK_LOCK:
+        try:
+            with OPTIMIZER_FEEDBACK_FILE.open('a',encoding='utf-8') as f: f.write(json.dumps(entry,ensure_ascii=False)+'\n')
+            if OPTIMIZER_FEEDBACK_FILE.stat().st_size>1000000:
+                lines=OPTIMIZER_FEEDBACK_FILE.read_text(encoding='utf-8').splitlines()[-500:]
+                tmp=OPTIMIZER_FEEDBACK_FILE.with_suffix('.tmp'); tmp.write_text('\n'.join(lines)+'\n',encoding='utf-8'); tmp.replace(OPTIMIZER_FEEDBACK_FILE)
+        except Exception as exc:
+            app.logger.exception('Optimierervorschlag konnte nicht gespeichert werden')
+            return jsonify({'ok':False,'message':'Der Vorschlag konnte lokal nicht gespeichert werden: '+str(exc)[:160]}),500
+    return jsonify({'ok':True,'message':'Vorschlag lokal gespeichert. Er ändert keine Einstellungen und wird nicht automatisch angewendet.'})
+
 def optimizer_report_loop():
     """Refresh the persisted report once when a new completed day is available."""
     while True:
@@ -2041,11 +2584,14 @@ def api_night_plan():
     st = c.get('settings', {})
     capacity = max(0.0, float(st.get('battery_capacity_kwh', 80)))
     learned_reserve_kwh = plan.get('recommended_morning_reserve_kwh')
-    # BTS batteries are configured with a physical 20% lower limit. The app's
-    # own reserve may be higher, but no learned recommendation may lower it.
-    hard_min_soc_percent = max(20.0, max(0.0, min(100.0, float(st.get('battery_reserve_percent', 20)))))
-    hard_floor_kwh = capacity * hard_min_soc_percent / 100.0
-    reserve_kwh = max(hard_floor_kwh, float(learned_reserve_kwh or 0.0))
+    # Keep the physical BMS floor separate from the app's strategic morning
+    # reserve. The Sofar can discharge to the hardware floor; after that, the
+    # house is supplied by the grid. The reserve is only a planning target.
+    hardware_min_soc_percent=max(0.0,min(95.0,float(st.get('battery_hard_min_percent',20))))
+    strategic_reserve_soc_percent=max(hardware_min_soc_percent,max(0.0,min(100.0,float(st.get('battery_reserve_percent',20)))))
+    hard_floor_kwh = capacity * hardware_min_soc_percent / 100.0
+    reserve_kwh = max(capacity*strategic_reserve_soc_percent/100.0, float(learned_reserve_kwh or 0.0))
+    morning_target_soc_percent=round(reserve_kwh/capacity*100,1) if capacity>0 else hardware_min_soc_percent
     current_kwh = capacity * max(0.0, min(100.0, soc)) / 100.0 if soc is not None else None
     gap_kwh = max(0.0, float(reserve_kwh) - current_kwh) if reserve_kwh is not None and current_kwh is not None else None
     import_price = max(0.0, float(st.get('import_price_eur_kwh', 0.30)))
@@ -2142,12 +2688,12 @@ def api_night_plan():
         status = 'nicht_bewertbar'
         recommendation = 'Keine belastbare Empfehlung: SoC oder Morgenreserve fehlt. Vorzeichen und Messdaten prüfen.'
     elif reserve_gap_after_night_kwh is not None and reserve_gap_after_night_kwh <= 0.25:
-        status = 'kein_zukauf_erforderlich'
-        recommendation = 'Unter Berücksichtigung der gelernten typischen Nachtentladung bleibt voraussichtlich genügend Energie für die Morgenreserve. Kein zusätzlicher Netzbezug empfohlen.'
+        status = 'morgenreserve_erreichbar'
+        recommendation = f'Die gelernte Nachtentladung lässt voraussichtlich mindestens {morning_target_soc_percent:.1f} % für das Morgen-Ziel. Die Batterie wird höchstens bis zur Hardware-Untergrenze von {hardware_min_soc_percent:.0f} % entladen; danach deckt Netzstrom den Hausverbrauch. Es wird keine Netzladung der Batterie angefordert.'
     elif reserve_gap_after_night_kwh is not None:
         status = 'nachtreserve_luecke'
-        recommendation = (f'Bei Fortsetzung der gelernten Nachtentladung könnten bis zum Morgen etwa {reserve_gap_after_night_kwh:.1f} kWh zur Reserve fehlen. '
-                          'Zuerst prüfen, ob die Nachtentladung sinkt oder lokal begrenzt werden kann. Netzbezug nur erwägen, wenn die Reserve wichtig ist und der Tarifvergleich inklusive Speicherverlusten dafür spricht.')
+        recommendation = (f'Bei Fortsetzung der gelernten Nachtentladung wird das strategische Morgen-Ziel voraussichtlich um etwa {reserve_gap_after_night_kwh:.1f} kWh unterschritten. '
+                          f'Der Speicher darf bis zur Hardware-Untergrenze von {hardware_min_soc_percent:.0f} % entladen; danach versorgt das Netz den Hausverbrauch direkt. Diese Reserve-Lücke ist kein Auftrag, die Batterie aus dem Netz zu laden.')
     else:
         status = 'nachtentladung_unbekannt'
         recommendation = 'Die Nachtentladung kann aus den vorhandenen Batterieleistungsdaten nicht zuverlässig geschätzt werden. Messhistorie und Vorzeichen-Einstellung prüfen; keine Reserveprognose ableiten.'
@@ -2174,7 +2720,9 @@ def api_night_plan():
         'battery_soc_percent':soc,'current_battery_energy_kwh':round(current_kwh,2) if current_kwh is not None else None,
         'pv_power_w':(values.get('pv_power') or {}).get('value'),'load_power_w':(values.get('load_power') or {}).get('value'),
         'grid_import_w':round(grid_import_w) if grid_import_w is not None else None,
-        'recommended_morning_reserve_kwh':reserve_kwh,'hardware_min_soc_percent':hard_min_soc_percent,'reserve_gap_kwh':round(gap_kwh,2) if gap_kwh is not None else None,
+        'recommended_morning_reserve_kwh':reserve_kwh,'hardware_min_soc_percent':hardware_min_soc_percent,
+        'strategic_reserve_soc_percent':morning_target_soc_percent,
+        'reserve_gap_kwh':round(gap_kwh,2) if gap_kwh is not None else None,
         'recommended_morning_soc_percent':plan.get('recommended_morning_soc_percent'),
         'learned_strategy':plan.get('learned_strategy',{}),
         'selected_strategy':'validiertes Lernmodell plus historische Median-Untergrenze' if (plan.get('learned_strategy') or {}).get('beats_baseline') else 'historischer Median (Lernmodell noch nicht ausreichend/besser)',

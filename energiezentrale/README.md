@@ -1,3 +1,30 @@
+# Energiezentrale 1.2.39
+
+## Tagesplanung, Verbraucherfenster und Sofar-Leistungsgrenze
+
+- Erstellt einen 15-Minuten-Schattenplan bis zur Abend-Ladefrist oder durch die Nacht bis zum Morgen.
+- Zeigt Batteriestand, erwarteten Netzbezug nach der Hardware-Untergrenze, PV-Prognose und mögliche Verbraucherfenster samt angenommener Laufzeit.
+- Trennt die physische 20-%-BMS-Untergrenze von einer höheren strategischen Morgenreserve. Unterhalb der Hardware-Grenze übernimmt in der Vorschau das Netz direkt den Hausverbrauch; eine Reserve-Lücke löst keine Batterieladung aus dem Netz aus.
+- Verbraucherstarts werden nur vorgeschlagen, wenn eine konservative Neuberechnung das Abendziel von mindestens 98,5 % SoC weiterhin erreicht.
+- Solcast-Zeitfensterattribute werden genutzt, wenn der HA-Sensor sie bereitstellt. Reine Tageswerte werden mit einem gelernten PV-Profil oder einer sichtbaren groben Tageskurve verteilt.
+- HA-Startimpulse erfordern weiterhin die globale und individuelle Freigabe, Gesamt-PCC-Bestätigung, eindeutigen AUS-Status, frische Livewerte und stabilen Überschuss. Bei nicht erreichbarem Speicherziel bleibt der Impuls gesperrt.
+- Bei zwei parallel geregelten Sofar-Wechselrichtern bleibt die Entlade-Leistungsgrenze bei 30 kW gesamt beziehungsweise −15 kW je Gerät gesetzt. Die physische Mindestgrenze muss im Wechselrichter/BMS übereinstimmend konfiguriert sein.
+- Die Übersicht enthält eine farbige Planansicht; schriftliche Energy-Brain-Erklärungen nennen jetzt die aktuellen Planwerte.
+- PV-Gesamtleistung, Hardware-Untergrenze und angenommene Laufzeit je Verbraucher sind konfigurierbar. Die Standardwerte entsprechen 50 kWp, 20 %, 60 Minuten für die Heizung und 20 Minuten für den Kompressor.
+
+## Version 1.2.38 – Erste Heizstufen-Schattenvorschau
+- Konfigurierbarer Ist-Leistungssensor pro Verbraucher; die Messung wird mit den Historienwerten gespeichert.
+- Neue Schattenvorschau vergleicht aktuelle Heizungsstufe, PV-Restprognose, Batterieladezustand und Ladeziel bis zum konfigurierten Abendfenster.
+- Für die bekannte Elektroheizung werden Standardstufen auf 7,5 / 15 / 20 / 30 kW gesetzt; alte Standardprofile mit 22,5 kW werden auf 20 kW migriert.
+- Die Vorschau ist ausdrücklich noch kein vollständiger Tagesoptimierer und sendet keine Befehle.
+
+## Version 1.2.37 – Schriftliche Fragen und Optimierervorschläge
+- Energy Brain beantwortet vorhandene Erklärungsfragen weiterhin lokal und schriftlich.
+- Neue Vorschlagsfunktion speichert Nutzervorschläge begrenzt und lokal in Home Assistant; Vorschläge ändern keine Regeln und werden nicht automatisch übernommen.
+
+## Version 1.2.36 – Verbraucheransicht vereinfacht
+- Doppelte Musteranzeige aus Verbraucher-Seite entfernt; Verbrauchsmuster und deren Beitrag zur Morgenreserve bleiben unter Lernen & Verlauf verfügbar.
+
 ## Version 1.2.35 – Animierter Live-Energiefluss
 - Übersichtsseite visualisiert PV, Haus, Speicher und Netz als animierten SVG-Energiefluss anhand aktueller HA-Messwerte.
 - Pfeilrichtung berücksichtigt konfigurierte Vorzeichen für Netz- und Batterieleistung; bei ungeprüftem Netzvorzeichen wird keine Netzrichtung geraten.
@@ -46,7 +73,7 @@ Home Assistant energy analysis and optional control add-on. Keeps prior overview
 Active control is opt-in and remains disabled by default. It supports one configured master control entity set that distributes identical per-inverter settings to a two-inverter master/slave pair. It requires verified grid-sensor polarity, fresh measurements in W and %, compatible Solax Modbus control entities, and a confirmed 5-minute watchdog configured to return to the previous mode. A control failure disables the setting and attempts to restore the saved mode; the inverter watchdog is the fallback. This assumes the master entity broadcasts its per-inverter setpoints to the slave, as confirmed for this installation. Failed state restoration, network interruptions and unknown firmware behavior must be reviewed in Home Assistant before enabling. Optional consumer start pulses can be sent to explicitly configured Home Assistant input buttons; the default is off. Energy estimates also depend on sensor mapping and history coverage.
 
 ## Validation
-Python syntax/AST and ZIP integrity checked. Python syntax compilation, Jinja template parsing, and ZIP integrity were tested. Full Home Assistant runtime test was not possible in the build environment because Flask is not installed there.
+Version 1.2.39 was checked with Python 3.14, Node, synthetic planner data, and local Flask page rendering. The live Home Assistant, Solcast attributes, and Sofar Modbus connection were not available for verification.
 
 
 Version 1.1.1: Netz- und Batteriesensor-Vorzeichen werden bei der Tagesenergiebilanz konfigurationsbasiert ausgewertet. Aktive Steuerung bleibt deaktiviert.
