@@ -1,4 +1,4 @@
-## Version 1.2.29 – Diagrammfarben und Linienarten
+## Version 1.2.30 – Nachtplan-Startseite
 - Energy Brain zeigt erklärbare Empfehlungen und beantwortet lokale Fragen zu PV, Netz und Speicher.
 - Energy Brain-Auswertung wird zwischengespeichert; die fehlende Auffälligkeitsanalyse für die Seite ist ergänzt.
 - Optionaler Sofar HYD Passivmodus-Regler für das parallele Master/Slave-Paar: Anlagen-Gesamtleistungen werden durch zwei geteilt. Bei 30 kW Gesamt-Entladegrenze bleiben bis zu −15 kW je Wechselrichter gesetzt. Laden ist auf den gemessenen PV-Überschuss nach Sicherheitsabstand begrenzt.

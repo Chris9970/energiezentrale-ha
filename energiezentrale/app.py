@@ -1894,9 +1894,12 @@ def api_night_plan():
                         else 'vorläufig' if discharge_slots else 'keine')
     estimated_night_end_kwh = max(0.0, current_kwh - night_discharge_kwh) if current_kwh is not None and discharge_slots else None
     reserve_gap_after_night_kwh = max(0.0, float(reserve_kwh) - estimated_night_end_kwh) if reserve_kwh is not None and estimated_night_end_kwh is not None else None
+    charge_efficiency=max(0.5,min(1.0,float(st.get('battery_roundtrip_efficiency',0.90) or 0.90)))
+    recommended_grid_purchase_kwh=(reserve_gap_after_night_kwh/charge_efficiency
+                                   if reserve_gap_after_night_kwh is not None else None)
     # A simple cost comparison is intentionally only indicative: without a time-of-use
     # tariff and measured round-trip efficiency, it cannot prove a grid purchase is cheaper.
-    indicative_grid_cost = reserve_gap_after_night_kwh * import_price if reserve_gap_after_night_kwh is not None else None
+    indicative_grid_cost = recommended_grid_purchase_kwh * import_price if recommended_grid_purchase_kwh is not None else None
     indicative_export_value = reserve_gap_after_night_kwh * export_price if reserve_gap_after_night_kwh is not None else None
     if gap_kwh is None:
         status = 'nicht_bewertbar'
@@ -1911,13 +1914,37 @@ def api_night_plan():
     else:
         status = 'nachtentladung_unbekannt'
         recommendation = 'Die Nachtentladung kann aus den vorhandenen Batterieleistungsdaten nicht zuverlässig geschätzt werden. Messhistorie und Vorzeichen-Einstellung prüfen; keine Reserveprognose ableiten.'
+    night_consumers=[]
+    for consumer in c.get('consumers',[]):
+        if not consumer.get('enabled'): continue
+        cv=(snap.get('consumer_values',{}).get(str(consumer.get('id','')),{}) or {})
+        state=(cv.get('compressor_state_entity') or {}).get('state')
+        external=consumer.get('management_mode')=='external'
+        night_consumers.append({'name':consumer.get('name','Verbraucher'),'nominal_power_w':int(consumer.get('nominal_power_w',0) or 0),
+            'management':'Home-Assistant-Automation' if external else 'Nur berücksichtigen',
+            'state':state or 'unbekannt','future_switch_time':None,
+            'note':('Derzeit von deiner HA-Automation geregelt; eine zukünftige Schaltzeit ist für die Energiezentrale nicht sichtbar.' if external else 'Keine automatische Schaltung eingerichtet.')})
+    morning_start=max(0,min(23,int(st.get('morning_start_hour',5))))
+    next_morning=datetime.now().astimezone().replace(hour=morning_start,minute=0,second=0,microsecond=0)
+    if next_morning<=datetime.now().astimezone(): next_morning+=timedelta(days=1)
+    morning_label=('Morgen ' if next_morning.date()!=datetime.now().astimezone().date() else 'Heute ')+next_morning.strftime('%H:%M')
+    raw_grid=(values.get('grid_power') or {}).get('value')
+    grid_sign=st.get('grid_import_sign','unverified')
+    grid_import_w=(-float(raw_grid) if grid_sign=='negative' else float(raw_grid) if grid_sign=='positive' else None) if isinstance(raw_grid,(int,float)) else None
     return jsonify({'mode':'advisory_only','commands_sent':False,'status':status,
         'battery_soc_percent':soc,'current_battery_energy_kwh':round(current_kwh,2) if current_kwh is not None else None,
+        'pv_power_w':(values.get('pv_power') or {}).get('value'),'load_power_w':(values.get('load_power') or {}).get('value'),
+        'grid_import_w':round(grid_import_w) if grid_import_w is not None else None,
         'recommended_morning_reserve_kwh':reserve_kwh,'reserve_gap_kwh':round(gap_kwh,2) if gap_kwh is not None else None,
+        'recommended_morning_soc_percent':plan.get('recommended_morning_soc_percent'),
         'learned_night_battery_discharge_slots':len(discharge_slots),'learned_night_battery_discharge_estimate_kwh':round(night_discharge_kwh,2),
         'learned_night_confidence':night_confidence,
         'estimated_battery_energy_at_morning_kwh':round(estimated_night_end_kwh,2) if estimated_night_end_kwh is not None else None,
+        'estimated_battery_soc_at_morning_percent':round(estimated_night_end_kwh/capacity*100,1) if estimated_night_end_kwh is not None and capacity>0 else None,
         'estimated_reserve_gap_after_night_kwh':round(reserve_gap_after_night_kwh,2) if reserve_gap_after_night_kwh is not None else None,
+        'recommended_grid_purchase_kwh':round(recommended_grid_purchase_kwh,2) if recommended_grid_purchase_kwh is not None else None,
+        'suggested_grid_purchase_before':f'{morning_start:02d}:00' if reserve_gap_after_night_kwh is not None and reserve_gap_after_night_kwh>0.25 else None,
+        'morning_start':f'{morning_start:02d}:00','morning_start_label':morning_label,'grid_import_sign':grid_sign,'consumers':night_consumers,
         'indicative_grid_cost_eur':round(indicative_grid_cost,2) if indicative_grid_cost is not None else None,
         'indicative_export_value_eur':round(indicative_export_value,2) if indicative_export_value is not None else None,
         'import_price_eur_kwh':import_price,'export_price_eur_kwh':export_price,
