@@ -1,4 +1,14 @@
-## Version 1.2.30 – Nachtplan-Startseite
+## Version 1.2.33 – Täglicher Optimierer-Bericht
+- Persistenter Tagesbericht vergleicht den letzten vollständigen Tag mit ähnlichen Wochentagen anhand PV-Ertrag und Start-SoC.
+- Bewertet PV, Hauslast, Netzbezug/Einspeisung, Batterieladung/-entladung, End-SoC und Messabdeckung.
+- Erklärbare Prüfhinweise nur bei ausreichenden Daten; Beobachtungsmodus ohne Regeländerungen oder Steuerbefehle.
+- Lokale Berechnung in einem kleinen Hintergrundlauf, geeignet für den Raspberry Pi 5; kein großes Sprachmodell.
+
+## Version 1.2.32 – Verbraucherimpulse über Home Assistant
+- Verbraucher können optional über je einen HA-`input_button` eine bestehende Automation anstoßen.
+- Impulse bleiben standardmäßig aus und benötigen globale sowie einzelne Freigabe, geprüften Gesamt-Netzsensor, frischen SoC, eindeutigen AUS-Status und anhaltenden Überschuss.
+
+## Version 1.2.31 – Lernender Nacht-Schattenoptimierer
 - Energy Brain zeigt erklärbare Empfehlungen und beantwortet lokale Fragen zu PV, Netz und Speicher.
 - Energy Brain-Auswertung wird zwischengespeichert; die fehlende Auffälligkeitsanalyse für die Seite ist ergänzt.
 - Optionaler Sofar HYD Passivmodus-Regler für das parallele Master/Slave-Paar: Anlagen-Gesamtleistungen werden durch zwei geteilt. Bei 30 kW Gesamt-Entladegrenze bleiben bis zu −15 kW je Wechselrichter gesetzt. Laden ist auf den gemessenen PV-Überschuss nach Sicherheitsabstand begrenzt.
@@ -24,7 +34,7 @@ Home Assistant energy analysis and optional control add-on. Keeps prior overview
 - All calculations are advisory. The PV forecast is interpreted according to the explicit configuration choice (daily total vs. remaining-day forecast); this remains an estimate, not a guaranteed surplus.
 
 ## Safety
-Active control is opt-in and remains disabled by default. It supports one configured master control entity set that distributes identical per-inverter settings to a two-inverter master/slave pair. It requires verified grid-sensor polarity, fresh measurements in W and %, compatible Solax Modbus control entities, and a confirmed 5-minute watchdog configured to return to the previous mode. A control failure disables the setting and attempts to restore the saved mode; the inverter watchdog is the fallback. This assumes the master entity broadcasts its per-inverter setpoints to the slave, as confirmed for this installation. Failed state restoration, network interruptions and unknown firmware behavior must be reviewed in Home Assistant before enabling. No consumer devices are switched. Energy estimates also depend on sensor mapping and history coverage.
+Active control is opt-in and remains disabled by default. It supports one configured master control entity set that distributes identical per-inverter settings to a two-inverter master/slave pair. It requires verified grid-sensor polarity, fresh measurements in W and %, compatible Solax Modbus control entities, and a confirmed 5-minute watchdog configured to return to the previous mode. A control failure disables the setting and attempts to restore the saved mode; the inverter watchdog is the fallback. This assumes the master entity broadcasts its per-inverter setpoints to the slave, as confirmed for this installation. Failed state restoration, network interruptions and unknown firmware behavior must be reviewed in Home Assistant before enabling. Optional consumer start pulses can be sent to explicitly configured Home Assistant input buttons; the default is off. Energy estimates also depend on sensor mapping and history coverage.
 
 ## Validation
 Python syntax/AST and ZIP integrity checked. Python syntax compilation, Jinja template parsing, and ZIP integrity were tested. Full Home Assistant runtime test was not possible in the build environment because Flask is not installed there.
@@ -38,3 +48,4 @@ Version 1.1.1: Netz- und Batteriesensor-Vorzeichen werden bei der Tagesenergiebi
 - Der Mindestumfang ist über `settings.morning_min_samples_per_day` konfigurierbar (Standard: 60 Messpunkte).
 - Weiterhin reine Empfehlung; keine Steuerbefehle an Wechselrichter oder Verbraucher.
 - Prüfung: Python-Syntax und ZIP-Integrität; Laufzeittest in Home Assistant steht noch aus.
+

@@ -29,27 +29,32 @@
       const r=await fetch('./api/night-plan',{cache:'no-store'});if(!r.ok)throw new Error('HTTP '+r.status);
       const d=await r.json();
       $('night-soc').innerHTML=fmt(d.estimated_battery_soc_at_morning_percent,1)+'<small> %</small>';
-      $('morning-target').innerHTML=fmt(d.recommended_morning_reserve_kwh!==null&&d.recommended_morning_reserve_kwh!==undefined&&Number(d.recommended_morning_reserve_kwh)>=0 ? d.recommended_morning_reserve_kwh : null,1)+'<small> kWh Reserve</small>';
+      $('morning-target').innerHTML=fmt(d.recommended_morning_soc_percent,0)+'<small> % SoC</small>';
       const confidence=d.learned_night_confidence||'keine';
-      $('night-confidence').textContent=d.learned_night_battery_discharge_slots>0?'Nachtentladung gelernt · Vertrauen '+confidence:'Zu wenig Nachtverlauf für eine SoC-Prognose';
+      const strategy=d.learned_strategy||{};
+      $('night-confidence').textContent=(d.learned_night_battery_discharge_slots>0?'Nachtprofil '+fmt(d.learned_night_profile_coverage_percent,0)+' % vollständig · Vertrauen '+confidence:'Zu wenig Nachtverlauf für eine SoC-Prognose')+' · '+(strategy.status||'Lernmodell wartet');
       $('grid-purchase').innerHTML=fmt(d.recommended_grid_purchase_kwh,2)+'<small> kWh</small>';
-      $('grid-purchase-time').textContent=d.suggested_grid_purchase_before?'Falls Reserve-Schutz gewünscht: vor '+d.suggested_grid_purchase_before:'Kein belastbarer Zukaufzeitpunkt ermittelt';
-      $('night-explanation').textContent=d.recommendation||'Keine Nachtplanung verfügbar.';
+      $('grid-purchase-time').textContent=d.suggested_grid_purchase_before?'Reserve vorsorglich sichern vor '+d.suggested_grid_purchase_before:'Kein Zukauf vor dem Morgen prognostiziert';
+      $('night-explanation').textContent=(d.recommendation||'Keine Nachtplanung verfügbar.')+' Grundlage: '+(d.selected_strategy||'historische Lernwerte')+'.';
       const timeline=$('night-timeline');timeline.replaceChildren();
       const now=new Date().toLocaleTimeString('de-AT',{hour:'2-digit',minute:'2-digit'});
       const current=d.battery_soc_percent;
       addTimeline(timeline,now,'Jetzt · Speicherstand '+(current===null?'unbekannt':fmt(current,1)+' %'),
         d.current_battery_energy_kwh===null?'Batterie-SoC oder Speicherkapazität fehlt.':fmt(d.current_battery_energy_kwh,1)+' kWh gespeicherte Energie laut konfigurierter Kapazität.');
-      const morning=d.morning_start||'05:00';
+      const morning=d.morning_start_label||('Morgen '+(d.morning_start||'05:00'));
+      if(d.night_start_label)addTimeline(timeline,d.night_start_label,'Gelernter Nachtplan startet','Ab hier wird die typische Entladung aus historischen 15-Minuten-Zeitfenstern geschätzt.');
+      (d.night_forecast_slots||[]).filter((x,i,a)=>x.time.endsWith(':00')||i===a.length-1).forEach(x=>{
+        if(x.expected_soc_after_percent!==null)addTimeline(timeline,x.time,'Prognose · '+fmt(x.expected_soc_after_percent,1)+' % SoC',fmt(x.expected_discharge_w,0)+' W typische Entladung · '+x.days_seen+' Messtage.');
+      });
       if(d.estimated_battery_soc_at_morning_percent!==null&&d.estimated_battery_soc_at_morning_percent!==undefined){
         addTimeline(timeline,'bis '+morning,'Erwarteter Morgenstand '+fmt(d.estimated_battery_soc_at_morning_percent,1)+' %',
-          'Aus typischer Nachtentladung von '+fmt(d.learned_night_battery_discharge_estimate_kwh,2)+' kWh; Vertrauen: '+confidence+'.');
+          'Noch erwartete Nachtentladung: '+fmt(d.expected_remaining_night_discharge_kwh,2)+' kWh; Vertrauen: '+confidence+'.');
       }else{
         addTimeline(timeline,'bis '+morning,'Morgen-SoC noch nicht berechenbar',
           'Für genügend Nachtmessungen mit bestätigtem Batterie-Vorzeichen fehlen noch Daten.');
       }
       if(num(d.recommended_grid_purchase_kwh)!==null&&Number(d.recommended_grid_purchase_kwh)>0.25){
-        addTimeline(timeline,'vor '+morning,'Möglicher Netzzukauf '+fmt(d.recommended_grid_purchase_kwh,2)+' kWh',
+        addTimeline(timeline,'vor '+(d.suggested_grid_purchase_before||morning),'Möglicher Netzzukauf '+fmt(d.recommended_grid_purchase_kwh,2)+' kWh',
           'Das wäre nötig, um die geschätzte Morgenreserve inklusive Ladeverlusten zu erreichen. Die App kauft nicht selbst ein; ohne zeitabhängigen Tarif lässt sich keine günstigste Uhrzeit bestimmen.','timeline-action');
       }else if(d.status==='kein_zukauf_erforderlich'){
         addTimeline(timeline,'vor '+morning,'Kein zusätzlicher Zukauf empfohlen',

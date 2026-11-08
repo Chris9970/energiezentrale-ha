@@ -5,6 +5,7 @@ from flask import Flask,render_template,request,redirect,url_for,flash,jsonify
 import requests
 app=Flask(__name__); app.secret_key='local-energy-app'
 DATA=Path('/data'); DATA.mkdir(exist_ok=True); CFG=DATA/'config.json'; HIST=DATA/'history.jsonl'; LEARN_STATE=DATA/'learning_state.json'
+OPTIMIZER_REPORT_FILE=DATA/'daily_optimizer_report.json'
 
 def learning_start_timestamp():
     """Persist the start of the new learning period; old history is excluded."""
@@ -116,7 +117,7 @@ DEFAULT={'plant_name':'Meine Energiezentrale','sensors':{
 'inverter_output':{'label':'Wechselrichter-Ausgangsleistung','entity_id':'sensor.sofar_speicher_active_power_output_total','unit':'W'},
 'pv_forecast':{'label':'PV-Prognose','entity_id':'sensor.solcast_pv_forecast_prognose_heute','unit':'Wh'}},
 'consumers':[{'id':'heater','name':'Elektroheizung','type':'heater','enabled':True,'nominal_power_w':30000,'stages_w':[7500,15000,22500,30000],'priority':1,'temperature_sensor_entity':'','target_temperature_c':55.0},{'id':'compressor','name':'Kompressor','type':'motor','enabled':True,'nominal_power_w':11000,'stages_w':[],'priority':2,'pressure_sensor_entity':'','pressure_min_bar':4.5,'pressure_max_bar':7.0,'receiver_volume_l':500,'compressor_on_bar':6.0,'compressor_off_bar':8.0,'leak_monitor_enabled':True,'compressor_state_entity':'','temperature_sensor_entity':'','target_temperature_c':20.0}],
-'control_entities':{'mode':'select.sofar_speicher_inverter_energy_storage_mode','grid_setpoint':'number.sofar_speicher_inverter_passive_desired_grid_power','charge_power':'number.sofar_speicher_inverter_passive_maximum_battery_power','discharge_power':'number.sofar_speicher_inverter_passive_minimum_battery_power','apply_button':'button.sofar_speicher_inverter_passive_update_battery_charge_discharge'},'settings':{'grid_import_limit_w':5000,'battery_reserve_percent':25,'inverter_count':2,'control_enabled':False,'mode':'observe','grid_setpoint_sign':'unverified','grid_import_sign':'unverified','battery_power_sign':'negative','morning_start_hour':5,'morning_end_hour':9,'learning_days':14,'morning_min_samples_per_day':60,'battery_capacity_kwh':80,'battery_discharge_power_kw':30,'silage_slots':['06:30','12:00','18:00'],'silage_flex_minutes':45,'silage_duration_minutes':15,'feeding_slots':['06:45','12:00','18:15'],'feeding_flex_minutes':10,'feeding_duration_minutes':8,'feeding_power_w':0,'consumer_surplus_margin_w':1000,'import_price_eur_kwh':0.30,'export_price_eur_kwh':0.04,'tariff_effective_month':'','tariff_history':[],'battery_roundtrip_efficiency':0.90,'peak_alert_w':5000,'balance_alert_pct':15,'pv_forecast_mode':'daily_total'}}
+'control_entities':{'mode':'select.sofar_speicher_inverter_energy_storage_mode','grid_setpoint':'number.sofar_speicher_inverter_passive_desired_grid_power','charge_power':'number.sofar_speicher_inverter_passive_maximum_battery_power','discharge_power':'number.sofar_speicher_inverter_passive_minimum_battery_power','apply_button':'button.sofar_speicher_inverter_passive_update_battery_charge_discharge'},'settings':{'grid_import_limit_w':5000,'battery_reserve_percent':25,'inverter_count':2,'control_enabled':False,'mode':'observe','grid_setpoint_sign':'unverified','grid_import_sign':'unverified','battery_power_sign':'negative','night_start_hour':18,'morning_start_hour':5,'morning_end_hour':9,'learning_days':14,'morning_min_samples_per_day':60,'battery_capacity_kwh':80,'battery_discharge_power_kw':30,'silage_slots':['06:30','12:00','18:00'],'silage_flex_minutes':45,'silage_duration_minutes':15,'feeding_slots':['06:45','12:00','18:15'],'feeding_flex_minutes':10,'feeding_duration_minutes':8,'feeding_power_w':0,'consumer_surplus_margin_w':1000,'import_price_eur_kwh':0.30,'export_price_eur_kwh':0.04,'tariff_effective_month':'','tariff_history':[],'battery_roundtrip_efficiency':0.90,'peak_alert_w':5000,'balance_alert_pct':15,'pv_forecast_mode':'daily_total'}}
 def config():
  if not CFG.exists(): CFG.write_text(json.dumps(DEFAULT,ensure_ascii=False,indent=2))
  try:
@@ -127,6 +128,7 @@ def config():
   c['control_entities'].setdefault('passive_timeout_action','select.sofar_speicher_inverter_passive_timeout_action')
   c['control_entities'].setdefault('timeout_apply_button','button.sofar_speicher_inverter_passive_update_timeout')
   c['settings'].setdefault('control_margin_w',300); c['settings'].setdefault('battery_charge_power_kw',30)
+  c['settings'].setdefault('consumer_dispatch_enabled',False); c['settings'].setdefault('consumer_dispatch_sustain_seconds',120); c['settings'].setdefault('consumer_dispatch_cooldown_minutes',30); c['settings'].setdefault('consumer_pcc_aggregate_confirmed',False)
   for k,v in DEFAULT['settings'].items(): c['settings'].setdefault(k,v)
   # Migrate the known mistaken 30 kW grid-import target to the intended soft target of 5 kW.
   # This affects only the advisory setting; no device commands are sent.
@@ -138,6 +140,7 @@ def config():
   for consumer in c.get('consumers',[]):
    consumer.setdefault('management_mode','advisory')
    consumer.setdefault('external_reserve_power_w',consumer.get('nominal_power_w',0))
+   consumer.setdefault('surplus_pulse_enabled',False); consumer.setdefault('surplus_start_button_entity',''); consumer.setdefault('surplus_start_power_w',consumer.get('nominal_power_w',0))
   return c
  except Exception: return json.loads(json.dumps(DEFAULT))
 def save(c): CFG.write_text(json.dumps(c,ensure_ascii=False,indent=2))
@@ -192,8 +195,10 @@ def sampler():
    s=snapshot(); row={'timestamp':s['timestamp'],'values':{k:(v or {}).get('value') for k,v in s['values'].items()},
              'consumer_values':{cid:{key:(val or {}).get('value') for key,val in vals.items()} for cid,vals in s.get('consumer_values',{}).items()}}
    with HIST.open('a') as f:f.write(json.dumps(row)+'\n')
-   if HIST.stat().st_size>15000000:
-    lines=HIST.read_text().splitlines()[-10000:]; HIST.write_text('\n'.join(lines)+'\n')
+   # Retain several weeks so the daily optimizer can compare recurring weekdays.
+   # Keep about a month at the default 10 s interval, enough for same-weekday peers.
+   if HIST.stat().st_size>120000000:
+    lines=HIST.read_text().splitlines()[-300000:]; HIST.write_text('\n'.join(lines)+'\n')
   except Exception:pass
   time.sleep(max(5,int(os.getenv('SAMPLE_INTERVAL_SECONDS','10'))))
 
@@ -476,6 +481,7 @@ def config_page():
    c['settings']['mode']='passive' if c['settings']['control_enabled'] else 'observe'
    c['settings']['morning_start_hour']=max(0,min(23,int(request.form.get('morning_start_hour','5'))))
    c['settings']['morning_end_hour']=max(1,min(24,int(request.form.get('morning_end_hour','9'))))
+   c['settings']['night_start_hour']=max(0,min(23,int(request.form.get('night_start_hour','18'))))
    c['settings']['grid_import_sign']=request.form.get('grid_import_sign','unverified') if request.form.get('grid_import_sign','unverified') in ('positive','negative','unverified') else 'unverified'
    c['settings']['battery_power_sign']=request.form.get('battery_power_sign','negative') if request.form.get('battery_power_sign','negative') in ('positive','negative') else 'negative'
    import_price=max(0,min(5,float(request.form.get('import_price_eur_kwh','0.30'))))
@@ -695,6 +701,7 @@ def consumers():
    save(c); flash('Verbraucher entfernt. Lernhistorie und übrige Einstellungen bleiben erhalten.','success')
    return redirect(url_for('consumers'))
   ids=request.form.getlist('consumer_id')
+  pulse_flags=request.form.getlist('consumer_pulse_enabled'); pulse_buttons=request.form.getlist('consumer_start_button'); pulse_powers=request.form.getlist('consumer_start_power')
   names=request.form.getlist('consumer_name'); types=request.form.getlist('consumer_type')
   powers=request.form.getlist('consumer_power'); priorities=request.form.getlist('consumer_priority')
   management_modes=request.form.getlist('consumer_management_mode'); external_reserves=request.form.getlist('consumer_external_reserve')
@@ -711,6 +718,10 @@ def consumers():
    x['priority']=num(priorities[i] if i<len(priorities) else x.get('priority',3),3,1,99)
    x['enabled']=str(x['id']) in request.form.getlist('consumer_enabled') or str(i) in enabled
    x['management_mode']=management_modes[i] if i<len(management_modes) and management_modes[i] in ('advisory','external') else x.get('management_mode','advisory')
+   x['surplus_pulse_enabled']=str(x['id']) in pulse_flags
+   pulse=(pulse_buttons[i].strip() if i<len(pulse_buttons) else x.get('surplus_start_button_entity',''))
+   x['surplus_start_button_entity']=pulse if (not pulse or (pulse.startswith('input_button.') and ' ' not in pulse)) else ''
+   x['surplus_start_power_w']=num(pulse_powers[i] if i<len(pulse_powers) else x.get('surplus_start_power_w',x.get('nominal_power_w',0)),x.get('nominal_power_w',0),0,250000)
    x['external_reserve_power_w']=num(external_reserves[i] if i<len(external_reserves) else x.get('external_reserve_power_w',x.get('nominal_power_w',0)),x.get('nominal_power_w',0),0,250000)
    x['operation_mode']=modes[i] if i<len(modes) and modes[i] in ('staged','stepless') else x.get('operation_mode','staged')
    raw=stages_list[i] if i<len(stages_list) else ''
@@ -727,7 +738,7 @@ def consumers():
    except ValueError:x['pressure_max_bar']=7.0
    def valid_entity(value):
     value=(value or '').strip()
-    return value if not value or (value.startswith(('sensor.','input_number.','binary_sensor.')) and ' ' not in value) else ''
+    return value if not value or (value.startswith(('sensor.','input_number.','binary_sensor.','switch.','input_boolean.')) and ' ' not in value) else ''
    x['receiver_volume_l']=num(volumes[i] if i<len(volumes) else x.get('receiver_volume_l',500),500,1,100000)
    try:x['compressor_on_bar']=max(0.0,min(30.0,float(onbars[i]))) if i<len(onbars) and onbars[i].strip() else x.get('compressor_on_bar',6.0)
    except ValueError:x['compressor_on_bar']=6.0
@@ -756,11 +767,91 @@ def consumers():
     'compressor_off_bar':max(0.0,min(30.0,float(request.form.get('new_off_bar','8') or 8))),
     'leak_monitor_enabled':request.form.get('new_leak_monitor')=='on',
     'compressor_state_entity':request.form.get('new_state_sensor','').strip(),
+    'surplus_pulse_enabled':False,'surplus_start_button_entity':'','surplus_start_power_w':power,
     'temperature_sensor_entity':request.form.get('new_temperature_sensor','').strip(),
     'target_temperature_c':max(-20.0,min(100.0,float(request.form.get('new_target_temperature','20') or 20)))})
-  save(c); flash('Verbraucher gespeichert. Extern geregelte Lasten werden in der Überschussplanung berücksichtigt; diese App schaltet keine Verbraucher.','success')
+  c['settings']['consumer_dispatch_enabled']=request.form.get('consumer_dispatch_enabled')=='on'
+  c['settings']['consumer_pcc_aggregate_confirmed']=request.form.get('consumer_pcc_aggregate_confirmed')=='on'
+  c['settings']['consumer_dispatch_sustain_seconds']=num(request.form.get('consumer_dispatch_sustain_seconds','120'),120,30,900)
+  c['settings']['consumer_dispatch_cooldown_minutes']=num(request.form.get('consumer_dispatch_cooldown_minutes','30'),30,5,360)
+  save(c); flash('Verbraucher gespeichert. Impulse sind '+('global freigegeben' if c['settings']['consumer_dispatch_enabled'] else 'global ausgeschaltet')+'; jeder Verbraucher benötigt zusätzlich eine eigene Freigabe, input_button und Statussensor.','success')
   return redirect(url_for('consumers'))
  return render_template('consumers.html',cfg=c)
+
+CONSUMER_DISPATCH_RUNTIME={'status':'Impulse ausgeschaltet','last_update':None,'consumers':[],'last_command':None}
+CONSUMER_DISPATCH_LOCK=threading.Lock()
+CONSUMER_SURPLUS_SINCE={}
+CONSUMER_LAST_PULSE={}
+CONSUMER_LAST_ANY_PULSE=0.0
+
+def consumer_dispatch_tick():
+    """Optionally pulse HA input_buttons when verified whole-plant surplus persists."""
+    global CONSUMER_LAST_ANY_PULSE
+    c=config(); st=c.get('settings',{}); report=[]
+    if not st.get('consumer_dispatch_enabled'):
+        with CONSUMER_DISPATCH_LOCK: CONSUMER_DISPATCH_RUNTIME.update(status='Impulse global ausgeschaltet',last_update=datetime.now(timezone.utc).isoformat(),consumers=[])
+        return
+    snap=snapshot(); vals=snap.get('values',{}); sign=st.get('grid_import_sign','unverified')
+    def fresh(key, max_age=90):
+        item=vals.get(key) or {}
+        try:
+            updated=datetime.fromisoformat(str(item.get('updated','')).replace('Z','+00:00')).timestamp()
+            return item.get('value') if time.time()-updated<=max_age and time.time()-updated>=-10 else None
+        except Exception: return None
+    raw_grid=fresh('grid_power'); soc=fresh('battery_soc'); raw_batt=fresh('battery_power')
+    export_w=(max(0.0,float(raw_grid)) if sign=='negative' else max(0.0,-float(raw_grid)) if sign=='positive' else None) if raw_grid is not None else None
+    reserve=float(st.get('battery_reserve_percent',20)); margin=max(0,float(st.get('consumer_surplus_margin_w',1000)))
+    batt_sign=st.get('battery_power_sign','negative')
+    charging=(float(raw_batt)>100 if batt_sign=='negative' else float(raw_batt)<-100) if raw_batt is not None else False
+    now=time.time(); sustain=max(30,int(st.get('consumer_dispatch_sustain_seconds',120))); cooldown=max(5,int(st.get('consumer_dispatch_cooldown_minutes',30)))*60
+    consumers=sorted((x for x in c.get('consumers',[]) if x.get('enabled') and x.get('management_mode')=='external' and x.get('surplus_pulse_enabled')),key=lambda x:int(x.get('priority',99)))
+    for x in consumers:
+        cid=str(x.get('id','')); button=str(x.get('surplus_start_button_entity','')); status_entity=str(x.get('compressor_state_entity',''))
+        status=(snap.get('consumer_values',{}).get(cid,{}) or {}).get('compressor_state_entity') or {}
+        raw_status=str(status.get('state','')).strip().lower()
+        if not c.get('settings',{}).get('consumer_dispatch_enabled'): reason='Global deaktiviert'
+        elif not button.startswith('input_button.'): reason='input_button nicht konfiguriert'
+        elif not status_entity: reason='Statussensor fehlt'
+        elif raw_status not in ('off','false','0'): reason='Verbraucherstatus nicht eindeutig AUS' if raw_status not in ('on','true','1','running','heat','heating') else 'Verbraucher läuft bereits'
+        elif not st.get('consumer_pcc_aggregate_confirmed'): reason='Gesamt-PCC über alle 5 Wechselrichter noch nicht bestätigt'
+        elif sign not in ('positive','negative') or export_w is None: reason='Netzsensor fehlt/veraltet oder Vorzeichen ungeprüft'
+        elif soc is None or float(soc)<reserve: reason=f'SoC fehlt/veraltet oder unter Reserve ({reserve:.0f} %)'
+        elif raw_batt is None: reason='Batterieleistung fehlt/veraltet'
+        elif not charging and float(soc)<99: reason='Batterie hat Vorrang: sie lädt noch nicht'
+        else:
+            required=max(0,float(x.get('surplus_start_power_w',x.get('nominal_power_w',0))))+margin
+            if export_w<required:
+                CONSUMER_SURPLUS_SINCE.pop(cid,None); reason=f'Überschuss {export_w:.0f} W; benötigt {required:.0f} W'
+            elif now-CONSUMER_LAST_PULSE.get(cid,0)<cooldown: reason='Wartezeit nach letztem Impuls'
+            elif now-CONSUMER_LAST_ANY_PULSE<30: reason='Kurze Pause nach anderem Impuls'
+            else:
+                started=CONSUMER_SURPLUS_SINCE.setdefault(cid,now)
+                if now-started<sustain: reason=f'Überschuss stabilisieren ({int(now-started)}/{sustain} s)'
+                else:
+                    ok,error=ha_service('input_button','press',{'entity_id':button})
+                    CONSUMER_LAST_PULSE[cid]=now; CONSUMER_LAST_ANY_PULSE=now; CONSUMER_SURPLUS_SINCE.pop(cid,None)
+                    reason='Startimpuls gesendet' if ok else 'Impuls fehlgeschlagen: '+str(error)
+                    if ok:
+                        CONSUMER_DISPATCH_RUNTIME['last_command']={'at':datetime.now(timezone.utc).isoformat(),'consumer':x.get('name'),'entity':button}
+                        app.logger.info('PV-Überschuss-Impuls gesendet: %s (%s)',x.get('name'),button)
+                    else: app.logger.error('PV-Überschuss-Impuls fehlgeschlagen: %s (%s)',x.get('name'),error)
+        if reason not in ('Wartezeit nach letztem Impuls','Kurze Pause nach anderem Impuls') and not reason.startswith('Überschuss stabilisieren'): CONSUMER_SURPLUS_SINCE.pop(cid,None)
+        report.append({'id':cid,'name':x.get('name','Verbraucher'),'reason':reason,'export_w':round(export_w) if export_w is not None else None})
+    status='Keine Verbraucher für Impuls freigegeben' if not consumers else ('Impulsprüfung aktiv' if not snap.get('ha_error') else 'Home Assistant nicht erreichbar')
+    with CONSUMER_DISPATCH_LOCK: CONSUMER_DISPATCH_RUNTIME.update(status=status,last_update=datetime.now(timezone.utc).isoformat(),consumers=report)
+
+def consumer_dispatch_loop():
+    while True:
+        try: consumer_dispatch_tick()
+        except Exception as exc:
+            app.logger.exception('Verbraucher-Impulsprüfung fehlgeschlagen')
+            with CONSUMER_DISPATCH_LOCK: CONSUMER_DISPATCH_RUNTIME.update(status='Sicherheitsfehler · keine Freigabe',last_update=datetime.now(timezone.utc).isoformat(),consumers=[{'reason':str(exc)[:180]}])
+        time.sleep(20)
+
+@app.route('/api/consumer-dispatch/status')
+def api_consumer_dispatch_status():
+    with CONSUMER_DISPATCH_LOCK: runtime=json.loads(json.dumps(CONSUMER_DISPATCH_RUNTIME))
+    return jsonify({'enabled':bool(config().get('settings',{}).get('consumer_dispatch_enabled')),'commands_sent':bool(runtime.get('last_command')),'runtime':runtime})
 
 def learn_load_patterns(rows, days=14, min_power_w=1000, min_days=3):
     """Learn recurring aggregate house-load patterns in local 15-minute slots.
@@ -1609,6 +1700,100 @@ def diagnostics():
     return render_template('diagnostics.html',cfg=c,sensors=sensors,history_count=len(rows),recent_count=len(recent),days=len(days),gaps=gaps,balance=balance,vals=vals,battery=battery)
 
 
+def build_daily_optimizer_report(rows=None):
+    """Lightweight, read-only day comparison; never changes control settings."""
+    c=config(); rows=rows if rows is not None else learning_rows(limit=500000)
+    grouped={}; grid_sign=c.get('settings',{}).get('grid_import_sign','unverified'); batt_sign=c.get('settings',{}).get('battery_power_sign','negative')
+    for row in rows:
+        try:
+            ts=datetime.fromisoformat(row.get('timestamp','').replace('Z','+00:00')).timestamp()
+            grouped.setdefault(datetime.fromtimestamp(ts).astimezone().date().isoformat(),[]).append((ts,row.get('values',{})))
+        except Exception: continue
+    daily={}
+    for day,points in grouped.items():
+        points.sort(key=lambda p:p[0]); total={k:0.0 for k in ('pv_kwh','load_kwh','grid_import_kwh','grid_export_kwh','charge_kwh','discharge_kwh')}
+        first_soc=last_soc=None; accepted=0; coverage_s=0
+        for (t0,a),(t1,b) in zip(points,points[1:]):
+            dt=t1-t0
+            if dt<=0 or dt>120: continue
+            accepted+=1; coverage_s+=dt
+            for key,out in (('pv_power','pv_kwh'),('load_power','load_kwh')):
+                x,y=a.get(key),b.get(key)
+                if isinstance(x,(int,float)) and isinstance(y,(int,float)): total[out]+=max(0,(float(x)+float(y))*0.5)*dt/3600000
+            x,y=a.get('grid_power'),b.get('grid_power')
+            if grid_sign in ('negative','positive') and isinstance(x,(int,float)) and isinstance(y,(int,float)):
+                mult=-1 if grid_sign=='negative' else 1
+                total['grid_import_kwh']+=(max(0,mult*x)+max(0,mult*y))*dt/7200000
+                total['grid_export_kwh']+=(max(0,-mult*x)+max(0,-mult*y))*dt/7200000
+            x,y=a.get('battery_power'),b.get('battery_power')
+            if isinstance(x,(int,float)) and isinstance(y,(int,float)):
+                mult=-1 if batt_sign=='negative' else 1
+                total['discharge_kwh']+=(max(0,mult*x)+max(0,mult*y))*dt/7200000
+                total['charge_kwh']+=(max(0,-mult*x)+max(0,-mult*y))*dt/7200000
+            for val in (a.get('battery_soc'),b.get('battery_soc')):
+                if isinstance(val,(int,float)):
+                    if first_soc is None: first_soc=float(val)
+                    last_soc=float(val)
+        coverage=min(1.0,coverage_s/86400)
+        if accepted:
+            daily[day]={**total,'start_soc':first_soc,'end_soc':last_soc,'coverage_pct':round(coverage*100),'samples':len(points),
+                'weekday':datetime.fromisoformat(day).weekday()}
+    yesterday=(datetime.now().astimezone().date()-timedelta(days=1)).isoformat()
+    target=daily.get(yesterday)
+    candidates=[(d,v) for d,v in daily.items() if d<yesterday and v['weekday']==(datetime.fromisoformat(yesterday).weekday()) and v['coverage_pct']>=50]
+    peers=[]
+    if target and target['coverage_pct']>=50:
+        for day,v in candidates:
+            pv_close=abs(v['pv_kwh']-target['pv_kwh'])<=max(2.0,target['pv_kwh']*0.30)
+            soc_close=target['start_soc'] is None or v['start_soc'] is None or abs(v['start_soc']-target['start_soc'])<=15
+            if pv_close and soc_close: peers.append((day,v))
+    peers=sorted(peers,reverse=True)[:8]
+    metrics=('pv_kwh','load_kwh','grid_import_kwh','grid_export_kwh','charge_kwh','discharge_kwh','end_soc')
+    comparison={}
+    for metric in metrics:
+        values=[v[metric] for _,v in peers if v.get(metric) is not None]
+        if target and target.get(metric) is not None and values:
+            med=statistics.median(values); comparison[metric]={'actual':round(target[metric],2),'peer_median':round(med,2),'delta':round(target[metric]-med,2)}
+    if not target: recommendation='Für gestern fehlen Tagesdaten; der Bericht wartet auf ausreichende Messhistorie.'
+    elif target['coverage_pct']<50: recommendation='Datenabdeckung unter 50 %: keine Optimierungsempfehlung, erst Sensor- und Aufzeichnungsabdeckung prüfen.'
+    elif len(peers)<3: recommendation=f'Nur {len(peers)} vergleichbare Tage gefunden. Weiter beobachten, bevor eine Strategie bewertet wird.'
+    else:
+        d_import=comparison.get('grid_import_kwh',{}).get('delta',0); d_soc=comparison.get('end_soc',{}).get('delta',0)
+        if d_import>1 and d_soc< -3: recommendation='Gestern gab es gegenüber ähnlichen Tagen mehr Netzbezug und einen niedrigeren End-SoC. Verbraucherzeitpunkt und PV-Prognose gemeinsam prüfen; noch keine automatische Änderung.'
+        elif d_import< -1 and d_soc>=-1: recommendation='Gutes Ergebnis gegenüber ähnlichen Tagen: weniger Netzbezug bei vergleichbarem End-SoC. Strategie weiter beobachten.'
+        else: recommendation='Kein eindeutiger Vorteil oder Nachteil gegenüber ähnlichen Tagen. Keine Regeländerung vorgeschlagen.'
+    report={'date':yesterday,'generated_at':datetime.now(timezone.utc).isoformat(),'mode':'Beobachtungsmodus · keine Steueränderungen',
+        'status':'Vergleich verfügbar' if target and len(peers)>=3 else 'Lernphase','actual':target,'peer_days':[{'date':d,**v} for d,v in peers],
+        'peer_count':len(peers),'comparison':comparison,'recommendation':recommendation,
+        'limits':['Verglichen werden gleiche Wochentage mit ähnlicher gemessener PV-Energie und Start-SoC.','Korrelation zeigt noch keine Ursache; Heizstufen- und Wetterdaten sind nicht automatisch vollständig verfügbar.','Änderungen an Speicherreglern oder HA-Automationen werden nicht ausgeführt.']}
+    try:
+        tmp=OPTIMIZER_REPORT_FILE.with_suffix('.tmp'); tmp.write_text(json.dumps(report,ensure_ascii=False)); tmp.replace(OPTIMIZER_REPORT_FILE)
+    except Exception: app.logger.exception('Tagesbericht konnte nicht gespeichert werden')
+    return report
+
+@app.route('/optimizer')
+def optimizer_page(): return render_template('optimizer.html')
+
+@app.route('/api/optimizer-report')
+def api_optimizer_report():
+    yesterday=(datetime.now().astimezone().date()-timedelta(days=1)).isoformat()
+    try:
+        cached=json.loads(OPTIMIZER_REPORT_FILE.read_text())
+        if cached.get('date')==yesterday: return jsonify(cached)
+    except Exception: pass
+    return jsonify(build_daily_optimizer_report())
+
+def optimizer_report_loop():
+    """Refresh the persisted report once when a new completed day is available."""
+    while True:
+        try:
+            yesterday=(datetime.now().astimezone().date()-timedelta(days=1)).isoformat()
+            try: current=json.loads(OPTIMIZER_REPORT_FILE.read_text()).get('date')
+            except Exception: current=None
+            if current!=yesterday: build_daily_optimizer_report()
+        except Exception: app.logger.exception('Täglicher Optimierer-Bericht fehlgeschlagen')
+        time.sleep(900)
+
 @app.route('/energy-report')
 def energy_report_page():
     c=config(); snap=snapshot(); rows=[]
@@ -1863,6 +2048,7 @@ def api_night_plan():
     learned_days = max(1, int(st.get('learning_days', 14)))
     cutoff = datetime.now(timezone.utc).timestamp() - learned_days * 86400
     morning_start = max(0, min(23, int(st.get('morning_start_hour', 5))))
+    night_start = max(0, min(23, int(st.get('night_start_hour', 18))))
     sign = st.get('battery_power_sign', 'negative')
     slot_days = {}
     for row in rows:
@@ -1874,7 +2060,8 @@ def api_night_plan():
             if not isinstance(raw, (int, float)) or abs(raw) > 100000:
                 continue
             dt = datetime.fromtimestamp(ts).astimezone()
-            if not (0 <= dt.hour < morning_start):
+            in_night = (dt.hour >= night_start or dt.hour < morning_start) if night_start >= morning_start else (night_start <= dt.hour < morning_start)
+            if not in_night:
                 continue
             discharge_w = max(0.0, -float(raw) if sign == 'negative' else float(raw))
             slot = dt.hour * 60 + (dt.minute // 15) * 15
@@ -1887,12 +2074,48 @@ def api_night_plan():
             continue
         daily_medians = [statistics.median(samples) for samples in by_day.values() if samples]
         if daily_medians:
-            discharge_slots.append({'median_w': statistics.median(daily_medians), 'days_seen': len(daily_medians)})
+            discharge_slots.append({'slot_minute':slot,'time':f'{slot//60:02d}:{slot%60:02d}',
+                                    'median_w': statistics.median(daily_medians), 'days_seen': len(daily_medians)})
     night_discharge_kwh = sum(max(0.0, p['median_w']) * 0.25 / 1000.0 for p in discharge_slots)
-    night_confidence = ('hoch' if discharge_slots and min(p['days_seen'] for p in discharge_slots) >= 7
+    night_hours=(24-night_start+morning_start) if night_start>=morning_start else (morning_start-night_start)
+    expected_night_slots=max(1,int(night_hours*4))
+    night_profile_coverage=len(discharge_slots)/expected_night_slots
+    night_confidence = ('lückenhaft' if night_profile_coverage<0.70 and discharge_slots else
+                        'hoch' if discharge_slots and min(p['days_seen'] for p in discharge_slots) >= 7
                         else 'mittel' if discharge_slots and min(p['days_seen'] for p in discharge_slots) >= 5
                         else 'vorläufig' if discharge_slots else 'keine')
-    estimated_night_end_kwh = max(0.0, current_kwh - night_discharge_kwh) if current_kwh is not None and discharge_slots else None
+    local_now=datetime.now().astimezone()
+    next_morning=local_now.replace(hour=morning_start,minute=0,second=0,microsecond=0)
+    if next_morning<=local_now: next_morning+=timedelta(days=1)
+    window_start=next_morning.replace(hour=night_start)
+    if night_start>=morning_start: window_start-=timedelta(days=1)
+    night_forecast_slots=[]
+    scheduled_night_slots=[]
+    for item in discharge_slots:
+        hour=item['slot_minute']//60; minute=item['slot_minute']%60
+        slot_date=(window_start.date() if night_start>=morning_start and hour>=night_start else next_morning.date())
+        slot_start=local_now.replace(year=slot_date.year,month=slot_date.month,day=slot_date.day,hour=hour,minute=minute,second=0,microsecond=0)
+        scheduled_night_slots.append((slot_start,item))
+    forecast_energy=current_kwh
+    remaining_night_discharge_kwh=0.0
+    reserve_crossing_time=local_now if reserve_kwh is not None and current_kwh is not None and current_kwh<=reserve_kwh else None
+    for slot_start,item in sorted(scheduled_night_slots,key=lambda pair:pair[0]):
+        hour=item['slot_minute']//60; minute=item['slot_minute']%60
+        slot_end=slot_start+timedelta(minutes=15)
+        overlap_start=max(local_now,slot_start)
+        if slot_end<=local_now or slot_start>=next_morning: continue
+        hours=max(0.0,(slot_end-overlap_start).total_seconds()/3600.0)
+        energy=max(0.0,float(item['median_w']))*hours/1000.0
+        remaining_night_discharge_kwh+=energy
+        if forecast_energy is not None:
+            forecast_energy=max(0.0,forecast_energy-energy)
+            if reserve_crossing_time is None and reserve_kwh is not None and forecast_energy<=reserve_kwh:
+                reserve_crossing_time=slot_end
+            night_forecast_slots.append({'time':item['time'],'slot_end':slot_end.isoformat(),
+                'expected_discharge_w':round(item['median_w']),'expected_energy_kwh':round(energy,3),
+                'expected_soc_after_percent':round(forecast_energy/capacity*100,1) if capacity>0 else None,
+                'days_seen':item['days_seen']})
+    estimated_night_end_kwh = max(0.0,current_kwh-remaining_night_discharge_kwh) if current_kwh is not None and discharge_slots and night_profile_coverage>=0.70 else None
     reserve_gap_after_night_kwh = max(0.0, float(reserve_kwh) - estimated_night_end_kwh) if reserve_kwh is not None and estimated_night_end_kwh is not None else None
     charge_efficiency=max(0.5,min(1.0,float(st.get('battery_roundtrip_efficiency',0.90) or 0.90)))
     recommended_grid_purchase_kwh=(reserve_gap_after_night_kwh/charge_efficiency
@@ -1925,9 +2148,11 @@ def api_night_plan():
             'state':state or 'unbekannt','future_switch_time':None,
             'note':('Derzeit von deiner HA-Automation geregelt; eine zukünftige Schaltzeit ist für die Energiezentrale nicht sichtbar.' if external else 'Keine automatische Schaltung eingerichtet.')})
     morning_start=max(0,min(23,int(st.get('morning_start_hour',5))))
-    next_morning=datetime.now().astimezone().replace(hour=morning_start,minute=0,second=0,microsecond=0)
-    if next_morning<=datetime.now().astimezone(): next_morning+=timedelta(days=1)
-    morning_label=('Morgen ' if next_morning.date()!=datetime.now().astimezone().date() else 'Heute ')+next_morning.strftime('%H:%M')
+    morning_label=('Morgen ' if next_morning.date()!=local_now.date() else 'Heute ')+next_morning.strftime('%H:%M')
+    night_label=('Laufende Nacht' if window_start<=local_now else ('Heute ' if window_start.date()==local_now.date() else 'Morgen ')+window_start.strftime('%H:%M'))
+    if reserve_gap_after_night_kwh is not None and reserve_gap_after_night_kwh>0.25:
+        grid_deadline='jetzt' if reserve_crossing_time is not None and reserve_crossing_time<=local_now+timedelta(minutes=1) else (reserve_crossing_time or next_morning).astimezone().strftime('%H:%M')
+    else: grid_deadline=None
     raw_grid=(values.get('grid_power') or {}).get('value')
     grid_sign=st.get('grid_import_sign','unverified')
     grid_import_w=(-float(raw_grid) if grid_sign=='negative' else float(raw_grid) if grid_sign=='positive' else None) if isinstance(raw_grid,(int,float)) else None
@@ -1937,13 +2162,18 @@ def api_night_plan():
         'grid_import_w':round(grid_import_w) if grid_import_w is not None else None,
         'recommended_morning_reserve_kwh':reserve_kwh,'reserve_gap_kwh':round(gap_kwh,2) if gap_kwh is not None else None,
         'recommended_morning_soc_percent':plan.get('recommended_morning_soc_percent'),
+        'learned_strategy':plan.get('learned_strategy',{}),
+        'selected_strategy':'validiertes Lernmodell plus historische Median-Untergrenze' if (plan.get('learned_strategy') or {}).get('beats_baseline') else 'historischer Median (Lernmodell noch nicht ausreichend/besser)',
         'learned_night_battery_discharge_slots':len(discharge_slots),'learned_night_battery_discharge_estimate_kwh':round(night_discharge_kwh,2),
-        'learned_night_confidence':night_confidence,
+        'learned_night_confidence':night_confidence,'learned_night_profile_coverage_percent':round(night_profile_coverage*100),
+        'learned_night_expected_slots':expected_night_slots,
+        'night_start_label':night_label,'expected_remaining_night_discharge_kwh':round(remaining_night_discharge_kwh,2),
+        'night_forecast_slots':night_forecast_slots,'reserve_crossing_time':reserve_crossing_time.isoformat() if reserve_crossing_time else None,
         'estimated_battery_energy_at_morning_kwh':round(estimated_night_end_kwh,2) if estimated_night_end_kwh is not None else None,
         'estimated_battery_soc_at_morning_percent':round(estimated_night_end_kwh/capacity*100,1) if estimated_night_end_kwh is not None and capacity>0 else None,
         'estimated_reserve_gap_after_night_kwh':round(reserve_gap_after_night_kwh,2) if reserve_gap_after_night_kwh is not None else None,
         'recommended_grid_purchase_kwh':round(recommended_grid_purchase_kwh,2) if recommended_grid_purchase_kwh is not None else None,
-        'suggested_grid_purchase_before':f'{morning_start:02d}:00' if reserve_gap_after_night_kwh is not None and reserve_gap_after_night_kwh>0.25 else None,
+        'suggested_grid_purchase_before':grid_deadline,
         'morning_start':f'{morning_start:02d}:00','morning_start_label':morning_label,'grid_import_sign':grid_sign,'consumers':night_consumers,
         'indicative_grid_cost_eur':round(indicative_grid_cost,2) if indicative_grid_cost is not None else None,
         'indicative_export_value_eur':round(indicative_export_value,2) if indicative_export_value is not None else None,
@@ -1958,4 +2188,4 @@ def api_night_plan():
 @app.route('/health')
 def health():return jsonify({'status':'ok','mode':'active_control' if CONTROL_RUNTIME.get('active') else 'observe','active_control_enabled':bool(CONTROL_RUNTIME.get('active')),'timestamp':datetime.now(timezone.utc).isoformat()})
 if __name__=='__main__':
- threading.Thread(target=sampler,daemon=True).start();threading.Thread(target=model_learning_loop,daemon=True).start();threading.Thread(target=controller_loop,daemon=True).start();app.run(host='0.0.0.0',port=int(os.getenv('PORT','8099')))
+ threading.Thread(target=sampler,daemon=True).start();threading.Thread(target=model_learning_loop,daemon=True).start();threading.Thread(target=controller_loop,daemon=True).start();threading.Thread(target=consumer_dispatch_loop,daemon=True).start();threading.Thread(target=optimizer_report_loop,daemon=True).start();app.run(host='0.0.0.0',port=int(os.getenv('PORT','8099')))
