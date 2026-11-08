@@ -3,7 +3,12 @@
   if (!chart) return;
   const ctx = chart.getContext('2d');
   const keys = ['pv_power', 'load_power', 'grid_power', 'battery_power'];
-  const palette = {pv:'#f6bd4b', load:'#62a8ff', grid:'#39d5a0', battery:'#bd91ff'};
+  const palette = {
+    pv:{color:'#ffd34e',dash:[]},
+    load:{color:'#42a5ff',dash:[9,4]},
+    grid:{color:'#27e0a0',dash:[3,3]},
+    battery:{color:'#d28cff',dash:[10,3,2,3]}
+  };
   const points = [];
   const maxPoints = 360;
   const status = document.getElementById('live-status');
@@ -27,8 +32,12 @@
     ctx.font='10px system-ui'; ctx.lineWidth=1; ctx.strokeStyle='#263746'; ctx.fillStyle='#8da0af';
     for(let i=0;i<=4;i++){const v=bound-i*bound/2, yy=y(v);ctx.beginPath();ctx.moveTo(x0,yy);ctx.lineTo(x1,yy);ctx.stroke();ctx.fillText((v/1000).toFixed(0)+'k',4,yy+3);}
     const zero=y(0);ctx.strokeStyle='#607483';ctx.beginPath();ctx.moveTo(x0,zero);ctx.lineTo(x1,zero);ctx.stroke();
-    keys.forEach(k=>{ctx.beginPath();ctx.strokeStyle=palette[k];ctx.lineWidth=2;let started=false;
-      points.forEach((p,i)=>{const v=p[k];if(v===null){started=false;return;}const xx=x0+i/(points.length-1)*(x1-x0), yy=y(v);if(!started){ctx.moveTo(xx,yy);started=true;}else ctx.lineTo(xx,yy);});ctx.stroke();});
+    keys.forEach(k=>{
+      const style=palette[k];ctx.save();ctx.beginPath();ctx.globalAlpha=1;ctx.strokeStyle=style.color;
+      ctx.lineWidth=2.8;ctx.lineCap='round';ctx.lineJoin='round';ctx.setLineDash(style.dash);let started=false;
+      points.forEach((p,i)=>{const v=p[k];if(v===null){started=false;return;}const xx=x0+i/(points.length-1)*(x1-x0), yy=y(v);if(!started){ctx.moveTo(xx,yy);started=true;}else ctx.lineTo(xx,yy);});
+      ctx.stroke();ctx.restore();
+    });
     const first=new Date(points[0].timestamp), last=new Date(points[points.length-1].timestamp);
     ctx.fillStyle='#8da0af';ctx.fillText(first.toLocaleTimeString('de-AT',{hour:'2-digit',minute:'2-digit'}),x0,y1+17);
     const label=last.toLocaleTimeString('de-AT',{hour:'2-digit',minute:'2-digit'});ctx.fillText(label,x1-ctx.measureText(label).width,y1+17);
