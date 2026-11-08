@@ -16,6 +16,22 @@
       $('live-pv').innerHTML=fmt(num(v.pv_power?.value),0)+' <small>W</small>';
       $('live-load').innerHTML=fmt(num(v.load_power?.value),0)+' <small>W</small>';
       const raw=num(v.grid_power?.value);$('live-grid').innerHTML=fmt(raw,0)+' <small>W · Sensorsignal</small>';
+      const pv=num(v.pv_power?.value), load=num(v.load_power?.value), batt=num(v.battery_power?.value), signs=d.signs||{};
+      const gridImport=raw===null||!['positive','negative'].includes(signs.grid_import_sign)?null:raw*(signs.grid_import_sign==='negative'?-1:1);
+      const discharge=batt===null?null:batt*(signs.battery_power_sign==='negative'?-1:1);
+      const charging=discharge!==null&&discharge < -100, discharging=discharge!==null&&discharge > 100;
+      const setFlow=(id,on,reverse=false,power=0)=>{const el=$(id);if(!el)return;el.classList.toggle('active',!!on);el.classList.toggle('reverse',!!on&&!!reverse);el.style.strokeWidth=String(2+Math.min(1,Math.max(0,power)/30000)*5);el.style.animationDuration=Math.max(.7,3-Math.max(0,power)/15000)+'s';};
+      setFlow('flow-pv-home',pv!==null&&pv>50&&load!==null&&load>50,false,pv||0);
+      setFlow('flow-pv-battery',pv!==null&&pv>50&&charging,false,Math.max(0,pv-(load||0)));
+      const batteryPath=$('flow-battery-home');setFlow('flow-battery-home',charging||discharging,charging,Math.abs(discharge||0));
+      if(batteryPath){batteryPath.removeAttribute('marker-start');batteryPath.removeAttribute('marker-end');if(discharging)batteryPath.setAttribute('marker-end','url(#arrow-battery)');if(charging)batteryPath.setAttribute('marker-start','url(#arrow-battery)');}
+      setFlow('flow-grid-import',gridImport!==null&&gridImport>50,false,gridImport||0);setFlow('flow-grid-export',gridImport!==null&&gridImport< -50,false,gridImport===null?0:-gridImport);
+      $('flow-pv-value').textContent=fmt(pv,0)+' W';$('flow-load-value').textContent=fmt(load,0)+' W';
+      const battKw=Math.abs(discharge||0)>=1000?fmt(Math.abs(discharge||0)/1000,1)+' kW':fmt(Math.abs(discharge||0),0)+' W';
+      $('flow-battery-value').textContent=(charging?'Lädt ':discharging?'Entlädt ':'')+battKw+' · '+fmt(soc,0)+'%';
+      const gridKw=gridImport===null?null:Math.abs(gridImport)>=1000?fmt(Math.abs(gridImport)/1000,1)+' kW':fmt(Math.abs(gridImport),0)+' W';
+      $('flow-grid-value').textContent=gridImport===null?'Vorzeichen ungeprüft':gridImport>50?gridKw+' Bezug':gridImport< -50?gridKw+' Einspeisung':'Nahe 0 W';
+      $('flow-updated').textContent='Live · '+new Date(d.timestamp).toLocaleTimeString('de-AT');
     }catch(e){status.textContent='● Live-Daten nicht erreichbar';status.classList.add('status-error');}
   }
   function addTimeline(list,time,title,description,kind=''){

@@ -1,3 +1,12 @@
+## Version 1.2.35 – Animierter Live-Energiefluss
+- Übersichtsseite visualisiert PV, Haus, Speicher und Netz als animierten SVG-Energiefluss anhand aktueller HA-Messwerte.
+- Pfeilrichtung berücksichtigt konfigurierte Vorzeichen für Netz- und Batterieleistung; bei ungeprüftem Netzvorzeichen wird keine Netzrichtung geraten.
+- Responsive Darstellung mit Rücksicht auf reduzierte Bewegungseinstellungen des Browsers.
+
+## Version 1.2.34 – Nachtprognose an 20-%-Batteriegrenze gebunden
+- Nacht-SoC-Projektion und Morgenreserve unterschreiten die konfigurierte Sofar/BTS-Untergrenze von 20 % nicht mehr.
+- Eine in der App höhere Reserve bleibt wirksam.
+
 ## Version 1.2.33 – Täglicher Optimierer-Bericht
 - Persistenter Tagesbericht vergleicht den letzten vollständigen Tag mit ähnlichen Wochentagen anhand PV-Ertrag und Start-SoC.
 - Bewertet PV, Hauslast, Netzbezug/Einspeisung, Batterieladung/-entladung, End-SoC und Messabdeckung.

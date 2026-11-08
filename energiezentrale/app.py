@@ -257,7 +257,8 @@ def build_battery_plan(c, rows, snap=None):
     st = c.get('settings', {})
     sign = st.get('grid_import_sign', 'unverified')
     target_w = max(0.0, float(st.get('grid_import_limit_w', 5000)))
-    reserve_pct = max(0.0, min(100.0, float(st.get('battery_reserve_percent', 25))))
+    # The BTS battery/inverter lower limit is physically fixed at 20% for this installation.
+    reserve_pct = max(20.0, max(0.0, min(100.0, float(st.get('battery_reserve_percent', 20)))))
     capacity_kwh = max(0.0, float(st.get('battery_capacity_kwh', 80)))
     max_discharge_kw = max(0.0, float(st.get('battery_discharge_power_kw', 30)))
     morning_start = int(st.get('morning_start_hour', 5))
@@ -436,7 +437,10 @@ def simulation():
  return render_template('simulation.html',cfg=c,snap=snap,vals=vals,grid_import=grid_import,surplus=surplus,battery=battery,missing=missing,history_count=len(rows),sign=sign)
 
 @app.route('/api/snapshot')
-def api_snapshot():return jsonify(snapshot())
+def api_snapshot():
+    s=snapshot(); st=config().get('settings',{})
+    s['signs']={'grid_import_sign':st.get('grid_import_sign','unverified'),'battery_power_sign':st.get('battery_power_sign','negative')}
+    return jsonify(s)
 @app.route('/api/dashboard-history')
 def api_dashboard_history():
     """Small recent sample window for the live dashboard chart."""
@@ -2036,7 +2040,12 @@ def api_night_plan():
         soc = None
     st = c.get('settings', {})
     capacity = max(0.0, float(st.get('battery_capacity_kwh', 80)))
-    reserve_kwh = plan.get('recommended_morning_reserve_kwh')
+    learned_reserve_kwh = plan.get('recommended_morning_reserve_kwh')
+    # BTS batteries are configured with a physical 20% lower limit. The app's
+    # own reserve may be higher, but no learned recommendation may lower it.
+    hard_min_soc_percent = max(20.0, max(0.0, min(100.0, float(st.get('battery_reserve_percent', 20)))))
+    hard_floor_kwh = capacity * hard_min_soc_percent / 100.0
+    reserve_kwh = max(hard_floor_kwh, float(learned_reserve_kwh or 0.0))
     current_kwh = capacity * max(0.0, min(100.0, soc)) / 100.0 if soc is not None else None
     gap_kwh = max(0.0, float(reserve_kwh) - current_kwh) if reserve_kwh is not None and current_kwh is not None else None
     import_price = max(0.0, float(st.get('import_price_eur_kwh', 0.30)))
@@ -2106,16 +2115,21 @@ def api_night_plan():
         if slot_end<=local_now or slot_start>=next_morning: continue
         hours=max(0.0,(slot_end-overlap_start).total_seconds()/3600.0)
         energy=max(0.0,float(item['median_w']))*hours/1000.0
-        remaining_night_discharge_kwh+=energy
         if forecast_energy is not None:
-            forecast_energy=max(0.0,forecast_energy-energy)
+            # Stop the forecast at the inverter's usable lower SoC. Historical
+            # median demand beyond that point would be met by grid import, not
+            # by an unavailable battery reserve.
+            available_above_floor=max(0.0,forecast_energy-hard_floor_kwh)
+            energy=min(energy,available_above_floor)
+            forecast_energy=max(hard_floor_kwh,forecast_energy-energy) if forecast_energy>=hard_floor_kwh else forecast_energy
+            remaining_night_discharge_kwh+=energy
             if reserve_crossing_time is None and reserve_kwh is not None and forecast_energy<=reserve_kwh:
                 reserve_crossing_time=slot_end
             night_forecast_slots.append({'time':item['time'],'slot_end':slot_end.isoformat(),
                 'expected_discharge_w':round(item['median_w']),'expected_energy_kwh':round(energy,3),
                 'expected_soc_after_percent':round(forecast_energy/capacity*100,1) if capacity>0 else None,
                 'days_seen':item['days_seen']})
-    estimated_night_end_kwh = max(0.0,current_kwh-remaining_night_discharge_kwh) if current_kwh is not None and discharge_slots and night_profile_coverage>=0.70 else None
+    estimated_night_end_kwh = (max(hard_floor_kwh,current_kwh-remaining_night_discharge_kwh) if current_kwh is not None and current_kwh>=hard_floor_kwh else current_kwh) if current_kwh is not None and discharge_slots and night_profile_coverage>=0.70 else None
     reserve_gap_after_night_kwh = max(0.0, float(reserve_kwh) - estimated_night_end_kwh) if reserve_kwh is not None and estimated_night_end_kwh is not None else None
     charge_efficiency=max(0.5,min(1.0,float(st.get('battery_roundtrip_efficiency',0.90) or 0.90)))
     recommended_grid_purchase_kwh=(reserve_gap_after_night_kwh/charge_efficiency
@@ -2160,7 +2174,7 @@ def api_night_plan():
         'battery_soc_percent':soc,'current_battery_energy_kwh':round(current_kwh,2) if current_kwh is not None else None,
         'pv_power_w':(values.get('pv_power') or {}).get('value'),'load_power_w':(values.get('load_power') or {}).get('value'),
         'grid_import_w':round(grid_import_w) if grid_import_w is not None else None,
-        'recommended_morning_reserve_kwh':reserve_kwh,'reserve_gap_kwh':round(gap_kwh,2) if gap_kwh is not None else None,
+        'recommended_morning_reserve_kwh':reserve_kwh,'hardware_min_soc_percent':hard_min_soc_percent,'reserve_gap_kwh':round(gap_kwh,2) if gap_kwh is not None else None,
         'recommended_morning_soc_percent':plan.get('recommended_morning_soc_percent'),
         'learned_strategy':plan.get('learned_strategy',{}),
         'selected_strategy':'validiertes Lernmodell plus historische Median-Untergrenze' if (plan.get('learned_strategy') or {}).get('beats_baseline') else 'historischer Median (Lernmodell noch nicht ausreichend/besser)',
