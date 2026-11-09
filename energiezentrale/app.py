@@ -1705,7 +1705,22 @@ def build_day_ahead_plan(c=None, rows=None, snap=None):
     floor_kwh=capacity*hard_min/100.0
     reserve_pct=max(hard_min,min(100.0,float(st.get('battery_reserve_percent',hard_min))))
     reserve_kwh=capacity*reserve_pct/100.0
-    soc=_plan_number(values.get('battery_soc'),180)
+    soc_item=values.get('battery_soc') or {}
+    soc=_plan_number(soc_item,180); soc_source='aktuell'
+    soc_age_seconds=None
+    soc_updated=_plan_timestamp(soc_item.get('updated'))
+    if soc_updated is not None:
+        soc_age_seconds=max(0.0,(now-soc_updated).total_seconds())
+    if soc is None:
+        # Some inverter integrations publish SoC only when it changes. For the
+        # read-only forecast, reuse a bounded last value if other plant sensors
+        # prove that Home Assistant telemetry is still arriving. Active control
+        # has its own stricter freshness checks and never uses this fallback.
+        held_soc=_plan_number(soc_item,86400)
+        live_heartbeat=any(_plan_number(values.get(key),180) is not None
+                           for key in ('pv_power','load_power','grid_power','battery_power'))
+        if held_soc is not None and 0.0<=held_soc<=100.0 and live_heartbeat:
+            soc=held_soc; soc_source='letzter SoC mit aktuellen Anlagendaten'
     start_kwh=capacity*max(0.0,min(100.0,soc or 0.0))/100.0 if soc is not None else None
     charge_cap=max(0.0,float(st.get('battery_charge_power_kw',30)))*1000.0
     discharge_cap=max(0.0,float(st.get('battery_discharge_power_kw',30)))*1000.0
@@ -1823,6 +1838,9 @@ def build_day_ahead_plan(c=None, rows=None, snap=None):
     baseline_deadline_kwh=(baseline[deadline_index]['energy_kwh'] if baseline else start_kwh)
     full_reachable=bool(charge_deadline and baseline_deadline_kwh>=capacity*0.985)
     consumer_windows=[]; scheduled=[]; notes=[]; consumer_blocks=[]; optimizer_candidates=0; optimizer_score=0.0
+    if soc is not None and soc_source!='aktuell':
+        age_text=f'{soc_age_seconds/3600:.1f} Stunden' if soc_age_seconds is not None else 'unbekannter Zeit'
+        notes.append(f'Der letzte SoC-Wert ({soc:.1f} %) wurde vor {age_text} gemeldet. Weil andere Anlagensensoren aktuell sind, wird er nur für diese lesende Vorschau verwendet; Live-Steuerbefehle benötigen weiterhin frische Werte.')
     def schedule_metrics(simulated):
         return {
             'grid_kwh':sum(x['grid_import_w']*float(x.get('minutes',15))/60000.0 for x in simulated),
@@ -1934,7 +1952,9 @@ def build_day_ahead_plan(c=None, rows=None, snap=None):
         'forecast_source':forecast_source,'forecast_remaining_kwh':round(remaining_forecast,2) if remaining_forecast is not None else None,
         'forecast_safety_factor':0.80 if not interval_forecast and phase=='pv_to_evening' else 1.0,
         'profile_days':profile_days,'load_profile_slots':len(load_profile),'pv_profile_slots':len(pv_profile),
-        'battery_soc_percent':round(soc,1),'predicted_soc_at_deadline_percent':round(predicted_deadline/capacity*100,1) if capacity else None,
+        'battery_soc_percent':round(soc,1),'battery_soc_source':soc_source,
+        'battery_soc_age_minutes':round(soc_age_seconds/60,1) if soc_age_seconds is not None else None,
+        'predicted_soc_at_deadline_percent':round(predicted_deadline/capacity*100,1) if capacity else None,
         'battery_target_soc_percent':99 if charge_deadline else round(reserve_pct,1),'battery_target_reachable':target_reached,
         'battery_only_soc_at_deadline_percent':round(baseline_deadline_kwh/capacity*100,1) if capacity else None,
         'charge_deadline':charge_deadline.isoformat() if charge_deadline else None,'horizon_end':end.isoformat(),

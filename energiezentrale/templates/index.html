@@ -13,7 +13,8 @@
 <div class="columns dashboard-columns"><section class="panel"><div class="panel-heading"><div><h2>Geplanter Ablauf der Nacht</h2><p class="hint">Empfehlungen mit Zeitbezug; keine Befehle werden ausgeführt.</p></div><span class="tag">Heute Nacht</span></div><ol id="night-timeline" class="night-timeline"><li>Plan wird geladen …</li></ol></section>
 <section class="panel"><div class="panel-heading"><div><h2>Verbraucher und Automationen</h2><p class="hint">Externe HA-Automationen bleiben die Schaltinstanz.</p></div><a href="./consumers">Verwalten →</a></div><div id="night-consumers"><p class="hint">Verbraucherstatus wird geladen …</p></div><p class="hint">Die eigene 15-Minuten-Vorschau oben zeigt mögliche Verbraucherfenster. Eine von deiner HA-Automation unabhängig geplante Schaltzeit ist nur sichtbar, wenn Home Assistant dafür einen Sensor oder Helfer bereitstellt.</p></section></div>
 <section class="panel"><h2>Live-Status</h2><p class="hint">Momentaufnahme zur Einordnung des Nachtplans – kein Leistungsverlauf.</p><div class="metrics compact-metrics"><div class="metric"><span>PV-Leistung</span><strong id="live-pv">– <small>W</small></strong></div><div class="metric"><span>Hausverbrauch</span><strong id="live-load">– <small>W</small></strong></div><div class="metric"><span>Netzleistung</span><strong id="live-grid">– <small>W</small></strong></div><div class="metric"><span>Speicherregler</span><strong class="small-value">{{control_runtime.status}}</strong></div></div></section>
-<script src="static/dashboard.js?v=1.2.40" defer></script>
+<script src="static/dashboard.js?v=1.2.41" defer></script>
 {% endblock %}
+
 
 
