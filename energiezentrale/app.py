@@ -1780,9 +1780,9 @@ def build_day_ahead_plan(c=None, rows=None, snap=None):
         by_slot={}
         for (slot,day),points in night_days.items(): by_slot.setdefault(slot,[]).append(statistics.median(points))
         night_discharge={slot:statistics.median(points) for slot,points in by_slot.items() if len(points)>=3}
-    external_profiles={}; consumer_map={str(x.get('id','')):x for x in c.get('consumers',[]) if x.get('enabled')}
-    for cid,consumer in consumer_map.items():
-        if consumer.get('management_mode')=='external': external_profiles[cid]=consumer_profiles.get(cid,{})
+    consumer_load_profiles={}; consumer_map={str(x.get('id','')):x for x in c.get('consumers',[]) if x.get('enabled')}
+    for cid in consumer_map:
+        consumer_load_profiles[cid]=consumer_profiles.get(cid,{})
     slots=[]
     for dt,minutes in boundaries:
         slot=dt.hour*4+dt.minute//15; key=dt.replace(minute=(dt.minute//15)*15,second=0,microsecond=0).isoformat()
@@ -1796,10 +1796,12 @@ def build_day_ahead_plan(c=None, rows=None, snap=None):
         # Model measured external loads from their learned 15-minute profiles. If no
         # profile exists, use the current measured stage only while its state is on.
         external_w=0.0
-        for cid,consumer in external_profiles.items():
-            profile=external_profiles[cid].get(slot)
-            state=((snap.get('consumer_values',{}).get(cid,{}) or {}).get('compressor_state_entity') or {}).get('state','')
-            active=str(state).strip().lower() in ('on','true','1','running','heat','heating')
+        for cid,consumer in consumer_map.items():
+            cv=(snap.get('consumer_values',{}).get(cid,{}) or {})
+            state=str((cv.get('compressor_state_entity') or {}).get('state','')).strip().lower()
+            active=state in ('on','true','1','running','heat','heating') or (current_consumers.get(cid) is not None and current_consumers[cid]>25)
+            if consumer.get('management_mode')!='external' and not active: continue
+            profile=consumer_load_profiles[cid].get(slot)
             if profile is not None: external_w+=max(0.0,profile)
             elif active: external_w+=max(0.0,current_consumers.get(cid) or float(consumer.get('external_reserve_power_w',consumer.get('nominal_power_w',0)) or 0))
         if phase=='night':
@@ -1820,79 +1822,99 @@ def build_day_ahead_plan(c=None, rows=None, snap=None):
     target_kwh=capacity*(0.99 if charge_deadline else reserve_pct/100.0)
     baseline_deadline_kwh=(baseline[deadline_index]['energy_kwh'] if baseline else start_kwh)
     full_reachable=bool(charge_deadline and baseline_deadline_kwh>=capacity*0.985)
-    consumer_windows=[]; scheduled=[]; notes=[]; consumer_blocks=[]
+    consumer_windows=[]; scheduled=[]; notes=[]; consumer_blocks=[]; optimizer_candidates=0; optimizer_score=0.0
+    def schedule_metrics(simulated):
+        return {
+            'grid_kwh':sum(x['grid_import_w']*float(x.get('minutes',15))/60000.0 for x in simulated),
+            'export_kwh':sum(x['grid_export_w']*float(x.get('minutes',15))/60000.0 for x in simulated),
+            'discharge_kwh':sum(x['battery_discharge_w']*float(x.get('minutes',15))/60000.0 for x in simulated),
+            'peak_grid_w':max((x['grid_import_w'] for x in simulated),default=0.0),
+        }
+    current_sim=baseline; current_metrics=schedule_metrics(baseline)
     if phase=='pv_to_evening' and charge_deadline:
         if remaining_forecast is None: notes.append('Kein aktueller PV-Prognosesensorwert; Verbraucherplanung bleibt gesperrt.')
         elif not full_reachable: notes.append('Die vorsichtige Batterie-only-Prognose erreicht bis zur Abendfrist keine volle Batterie; Speicher hat Vorrang, daher keine geplanten Zusatzverbraucher.')
         else:
-            # Shadow opportunities are limited to configured discrete steps and are
-            # admitted only when a conservative full-day re-simulation still reaches 98.5%.
-            discretionary=sorted((x for x in consumer_map.values() if x.get('enabled')),key=lambda x:int(x.get('priority',99)))
-            for i,slot in enumerate(slots):
-                dt=_plan_timestamp(slot['time'])
-                if dt is None or dt>=charge_deadline: continue
-                baseline_charge=baseline[i]['battery_charge_w'] if i<len(baseline) else 0
-                local_left=max(0.0,slot['pv_w']-slot['load_w']-slot.get('planned_consumer_w',0)-baseline_charge-float(st.get('consumer_surplus_margin_w',1000)))
-                if local_left<500: continue
-                for consumer in discretionary:
-                    cid=str(consumer.get('id','')); current=current_consumers.get(cid)
-                    if any(x.get('consumer_id')==cid and _plan_timestamp(x.get('start'))<=dt<_plan_timestamp(x.get('end')) for x in scheduled):
-                        continue
-                    status=((snap.get('consumer_values',{}).get(cid,{}) or {}).get('compressor_state_entity') or {}).get('state','')
-                    active=str(status).strip().lower() in ('on','true','1','running','heat','heating')
-                    if active: continue
-                    if consumer.get('management_mode')=='external' and str(status).strip().lower() not in ('off','false','0'):
-                        message=f"{consumer.get('name','Verbraucher')}: externer Status fehlt oder ist nicht eindeutig AUS"
+            # Bounded rolling-horizon candidate search. Each consumer may receive
+            # one start window; every candidate is simulated over the full horizon.
+            # The optimizer is advisory and cannot change the configured limits.
+            available=[]
+            for consumer in sorted((x for x in consumer_map.values() if x.get('enabled')),key=lambda x:int(x.get('priority',99))):
+                cid=str(consumer.get('id','')); cv=(snap.get('consumer_values',{}).get(cid,{}) or {})
+                status=str((cv.get('compressor_state_entity') or {}).get('state','')).strip().lower()
+                if status in ('on','true','1','running','heat','heating'):
+                    continue
+                if consumer.get('management_mode')=='external' and status not in ('off','false','0'):
+                    message=f"{consumer.get('name','Verbraucher')}: externer Status fehlt oder ist nicht eindeutig AUS"
+                    if message not in consumer_blocks: consumer_blocks.append(message)
+                    continue
+                temp_entity=consumer.get('temperature_sensor_entity','')
+                if temp_entity and consumer.get('type') in ('heater','heat_pump'):
+                    temperature=_plan_number(cv.get('temperature_sensor_entity'),180)
+                    if temperature is None or temperature>=float(consumer.get('target_temperature_c',20.0)):
+                        message=f"{consumer.get('name','Verbraucher')}: Temperatur fehlt/veraltet oder Ziel bereits erreicht"
                         if message not in consumer_blocks: consumer_blocks.append(message)
                         continue
-                    cv=(snap.get('consumer_values',{}).get(cid,{}) or {})
-                    temp_entity=consumer.get('temperature_sensor_entity','')
-                    if temp_entity and consumer.get('type') in ('heater','heat_pump'):
-                        temperature=_plan_number(cv.get('temperature_sensor_entity'),180)
-                        target_temp=float(consumer.get('target_temperature_c',20.0))
-                        if temperature is None or temperature>=target_temp:
-                            message=f"{consumer.get('name','Verbraucher')}: Temperatur fehlt/veraltet oder Ziel bereits erreicht"
-                            if message not in consumer_blocks: consumer_blocks.append(message)
-                            continue
-                    pressure_entity=consumer.get('pressure_sensor_entity','')
-                    if pressure_entity and consumer.get('type')=='motor':
-                        pressure=_plan_number(cv.get('pressure_sensor_entity'),180)
-                        if pressure is None or pressure>=float(consumer.get('compressor_on_bar',6.0)):
-                            message=f"{consumer.get('name','Verbraucher')}: Drucksensor sperrt den Start oder ist nicht verfügbar"
-                            if message not in consumer_blocks: consumer_blocks.append(message)
-                            continue
-                    stages=sorted({int(v) for v in consumer.get('stages_w',[]) if int(v)>0})
-                    if not stages:
-                        nominal=int(consumer.get('nominal_power_w',0) or 0); stages=[nominal] if nominal>0 else []
-                    duration=max(15,min(720,int(consumer.get('plan_runtime_minutes',60) or 60)))
-                    if dt+timedelta(minutes=duration)>end:
-                        message=f"{consumer.get('name','Verbraucher')}: angenommene Laufzeit reicht über die Planungsfrist hinaus"
+                pressure_entity=consumer.get('pressure_sensor_entity','')
+                if pressure_entity and consumer.get('type')=='motor':
+                    pressure=_plan_number(cv.get('pressure_sensor_entity'),180)
+                    if pressure is None or pressure>=float(consumer.get('compressor_on_bar',6.0)):
+                        message=f"{consumer.get('name','Verbraucher')}: Drucksensor sperrt den Start oder ist nicht verfügbar"
                         if message not in consumer_blocks: consumer_blocks.append(message)
                         continue
-                    candidates=[x for x in stages if x<=local_left]
-                    for stage in reversed(candidates):
-                        test=[dict(x) for x in slots]
+                stages=sorted({int(v) for v in consumer.get('stages_w',[]) if int(v)>0})
+                if not stages:
+                    nominal=int(consumer.get('nominal_power_w',0) or 0); stages=[nominal] if nominal>0 else []
+                if not stages: continue
+                duration=max(15,min(720,int(consumer.get('plan_runtime_minutes',60) or 60)))
+                available.append((consumer,stages,duration))
+            selected_ids=set()
+            while available:
+                best=None
+                for consumer,stages,duration in available:
+                    cid=str(consumer.get('id',''))
+                    if cid in selected_ids: continue
+                    for i,slot in enumerate(slots):
+                        dt=_plan_timestamp(slot['time'])
+                        if dt is None or dt>=charge_deadline: continue
                         run_end=dt+timedelta(minutes=duration)
-                        for j in range(i,len(test)):
-                            step_start=_plan_timestamp(test[j]['time']); step_end=step_start+timedelta(minutes=float(test[j].get('minutes',15)))
-                            overlap=max(0.0,(min(step_end,run_end)-max(step_start,dt)).total_seconds()/60.0)
-                            if overlap>0: test[j]['planned_consumer_w']+=stage*overlap/max(0.1,float(test[j].get('minutes',15)))
-                        trial=_simulate_plan_battery(test,start_kwh,capacity,floor_kwh,charge_cap,discharge_cap,charge_eff,discharge_eff)
-                        trial_kwh=trial[deadline_index]['energy_kwh'] if trial else start_kwh
-                        if trial_kwh>=capacity*0.985:
-                            for j in range(i,len(slots)):
-                                step_start=_plan_timestamp(slots[j]['time']); step_end=step_start+timedelta(minutes=float(slots[j].get('minutes',15)))
+                        if run_end>end: continue
+                        for stage in stages:
+                            optimizer_candidates+=1
+                            trial_slots=[dict(x) for x in slots]
+                            for j in range(i,len(trial_slots)):
+                                step_start=_plan_timestamp(trial_slots[j]['time'])
+                                step_end=step_start+timedelta(minutes=float(trial_slots[j].get('minutes',15)))
                                 overlap=max(0.0,(min(step_end,run_end)-max(step_start,dt)).total_seconds()/60.0)
-                                if overlap>0: slots[j]['planned_consumer_w']+=stage*overlap/max(0.1,float(slots[j].get('minutes',15)))
-                            scheduled.append({'consumer_id':cid,'name':consumer.get('name','Verbraucher'),'start':slot['time'],
-                                'end':(dt+timedelta(minutes=duration)).isoformat(),'power_w':stage,'duration_minutes':duration,
-                                'management':consumer.get('management_mode','advisory'),'button_configured':bool(consumer.get('surplus_start_button_entity')),
-                                'reason':f'{stage} W passen in das lokale PV-Fenster; Batterie-only-Ziel bleibt nach Neuberechnung bei mindestens 98,5 %.'})
-                            break
-                    if scheduled and scheduled[-1].get('start')==slot['time']:
-                        break
+                                if overlap>0:
+                                    trial_slots[j]['planned_consumer_w']+=stage*overlap/max(0.1,float(trial_slots[j].get('minutes',15)))
+                            trial=_simulate_plan_battery(trial_slots,start_kwh,capacity,floor_kwh,charge_cap,discharge_cap,charge_eff,discharge_eff)
+                            trial_kwh=trial[deadline_index]['energy_kwh'] if trial else start_kwh
+                            if trial_kwh<capacity*0.985: continue
+                            trial_metrics=schedule_metrics(trial)
+                            delta_grid=trial_metrics['grid_kwh']-current_metrics['grid_kwh']
+                            delta_peak=max(0.0,trial_metrics['peak_grid_w']-current_metrics['peak_grid_w'])
+                            avoided_export=current_metrics['export_kwh']-trial_metrics['export_kwh']
+                            extra_discharge=max(0.0,trial_metrics['discharge_kwh']-current_metrics['discharge_kwh'])
+                            if delta_grid>0.01 or delta_peak>25.0: continue
+                            # Grid imports and new peaks are expensive; local PV use is
+                            # rewarded. A small cycle penalty discourages avoidable draw.
+                            score=delta_grid*100.0+(delta_peak/1000.0)*3.0+extra_discharge*0.5-avoided_export
+                            if score>=-0.01: continue
+                            if best is None or score<best['score']:
+                                best={'score':score,'slots':trial_slots,'sim':trial,'metrics':trial_metrics,
+                                    'consumer':consumer,'start':slot['time'],'end':run_end.isoformat(),
+                                    'stage':stage,'duration':duration,'deadline_kwh':trial_kwh}
+                if best is None: break
+                slots=best['slots']; current_sim=best['sim']; current_metrics=best['metrics']; optimizer_score+=best['score']
+                consumer=best['consumer']; cid=str(consumer.get('id','')); selected_ids.add(cid)
+                scheduled.append({'consumer_id':cid,'name':consumer.get('name','Verbraucher'),'start':best['start'],
+                    'end':best['end'],'power_w':best['stage'],'duration_minutes':best['duration'],
+                    'management':consumer.get('management_mode','advisory'),'button_configured':bool(consumer.get('surplus_start_button_entity')),
+                    'reason':f"Kandidatenvergleich: {best['stage']} W senkt prognostizierte Einspeisung, ohne Netzbezug, Lastspitze oder das Abendziel von 98,5 % zu verschlechtern."})
+                available=[entry for entry in available if str(entry[0].get('id',''))!=cid]
             if not scheduled: notes.append('Batterie kann voraussichtlich voll werden; in den geprüften 15-Minuten-Fenstern reicht der zusätzliche Überschuss nicht sicher für eine konfigurierte Stufe.')
-    final=_simulate_plan_battery(slots,start_kwh,capacity,floor_kwh,charge_cap,discharge_cap,charge_eff,discharge_eff)
+    final=current_sim if scheduled else baseline
     if charge_deadline and final:
         predicted_deadline=final[deadline_index]['energy_kwh']; target_reached=predicted_deadline>=capacity*0.985
     else:
@@ -1919,6 +1941,16 @@ def build_day_ahead_plan(c=None, rows=None, snap=None):
         'hard_min_soc_percent':hard_min,'strategic_reserve_percent':reserve_pct,
         'expected_grid_import_kwh':round(grid_energy,2),'expected_grid_export_kwh':round(export_energy,2),
         'consumer_windows':grouped,'consumer_blocks':consumer_blocks,'steps':final,'notes':notes,
+        'optimizer':{'algorithm':'Begrenzter Gesamthorizont-Kandidatenvergleich','mode':'shadow',
+            'candidates_evaluated':optimizer_candidates,'accepted_consumer_windows':len(scheduled),
+            'objective_score':round(optimizer_score,3),'profile_days':profile_days,
+            'comparison':{'baseline_grid_import_kwh':round(schedule_metrics(baseline)['grid_kwh'],2),
+                'optimized_grid_import_kwh':round(current_metrics['grid_kwh'],2),
+                'baseline_export_kwh':round(schedule_metrics(baseline)['export_kwh'],2),
+                'optimized_export_kwh':round(current_metrics['export_kwh'],2),
+                'grid_import_change_kwh':round(current_metrics['grid_kwh']-schedule_metrics(baseline)['grid_kwh'],2),
+                'export_change_kwh':round(current_metrics['export_kwh']-schedule_metrics(baseline)['export_kwh'],2)},
+            'learning':'PV- und Lastprofile werden aus der wachsenden Messhistorie neu gebildet; bei unzureichender Historie bleibt die PV-Tageskurve konservativ.'},
         'limitations':['Beobachtungsplan: keine Netzladung und keine Verbraucher-/Wechselrichterbefehle werden aus dieser Planung gesendet.',
           'Solcast-Tagesgesamtwerte enthalten keine Uhrzeiten; ohne Zeitfensterattribute werden sie anhand eines groben bzw. gelernten PV-Tagesprofils verteilt.',
           'Zusätzliche Verbraucher werden nur eingeplant, wenn eine konservative Neuberechnung das Abendziel von mindestens 98,5 % SoC weiter erreicht.',

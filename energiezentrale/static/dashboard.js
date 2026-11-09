@@ -112,14 +112,17 @@
       const r=await fetch('./api/day-plan',{cache:'no-store'});if(!r.ok)throw new Error('HTTP '+r.status);
       const d=await r.json(),steps=d.steps||[],timeline=$('day-plan-timeline');
       $('day-plan-title').textContent=d.phase==='night'?'Nachtplan bis zum Morgen':'Optimierter Ablauf bis zum Abend';
-      $('day-plan-status').textContent=(d.status||'Plan')+' · '+(d.phase==='night'?'Nacht':'bis '+(d.charge_deadline?new Date(d.charge_deadline).toLocaleTimeString('de-AT',{hour:'2-digit',minute:'2-digit'}):'morgen'));
+      const optimizer=d.optimizer||{};
+      $('day-plan-status').textContent=(d.status||'Plan')+' · '+(optimizer.candidates_evaluated||0)+' Varianten · '+(d.phase==='night'?'Nacht':'bis '+(d.charge_deadline?new Date(d.charge_deadline).toLocaleTimeString('de-AT',{hour:'2-digit',minute:'2-digit'}):'morgen'));
       $('plan-end-soc').innerHTML=fmt(d.predicted_soc_at_deadline_percent,1)+'<small> %</small>';
       $('plan-end-label').textContent=d.charge_deadline?'Prognose zur Abendfrist '+new Date(d.charge_deadline).toLocaleTimeString('de-AT',{hour:'2-digit',minute:'2-digit'}):'Prognose bis '+new Date(d.horizon_end).toLocaleTimeString('de-AT',{hour:'2-digit',minute:'2-digit'});
       $('plan-grid-kwh').innerHTML=fmt(d.expected_grid_import_kwh,2)+'<small> kWh</small>';
       $('plan-pv-kwh').innerHTML=fmt(d.forecast_remaining_kwh,1)+'<small> kWh</small>';
       $('plan-forecast-source').textContent=(d.forecast_source||'Keine PV-Prognose')+(d.profile_days?' · '+d.profile_days+' Profil-Tage':'');
       $('plan-priority').textContent=d.phase==='night'?'Batterie bis Hardware-Minimum':d.battery_target_reachable?'Vollladung voraussichtlich erreichbar':'Speicher zuerst · Stufen gesperrt';
-      $('day-plan-explanation').textContent=d.phase==='night'?'Nachtprognose bis zum Morgen. Erwarteter Netzbezug versorgt den Hausverbrauch erst, wenn die Batterie ihre Hardware-Untergrenze erreicht; Netzladung ist nicht eingeplant. '+(d.notes||[]).join(' '):(d.battery_target_reachable?'Der prognostizierte PV-Ertrag reicht voraussichtlich, um bis zur Abendfrist mindestens 98,5 % zu erreichen.':'Die Batterie-only-Rechnung erreicht das Abendziel voraussichtlich nicht; geplante Zusatzverbraucher bleiben gesperrt.')+' '+(d.notes||[]).join(' ');
+      const comparison=optimizer.comparison||{};
+      const learned=('Schattenoptimierer: '+(optimizer.candidates_evaluated||0)+' Varianten, '+(optimizer.profile_days||d.profile_days||0)+' Lerntage. Prognosevergleich Netz '+fmt(comparison.baseline_grid_import_kwh,2)+' → '+fmt(comparison.optimized_grid_import_kwh,2)+' kWh; Einspeisung '+fmt(comparison.baseline_export_kwh,2)+' → '+fmt(comparison.optimized_export_kwh,2)+' kWh.');
+      $('day-plan-explanation').textContent=(d.phase==='night'?'Nachtprognose bis zum Morgen. Erwarteter Netzbezug versorgt den Hausverbrauch erst, wenn die Batterie ihre Hardware-Untergrenze erreicht; Netzladung ist nicht eingeplant. '+learned+' ':(d.battery_target_reachable?'Der prognostizierte PV-Ertrag reicht voraussichtlich, um bis zur Abendfrist mindestens 98,5 % zu erreichen.':'Die Batterie-only-Rechnung erreicht das Abendziel voraussichtlich nicht; geplante Zusatzverbraucher bleiben gesperrt.')+' '+learned+' ')+(d.notes||[]).join(' ');
       renderDayPlanChart(steps);timeline.replaceChildren();
       if(!steps.length){addTimeline(timeline,'jetzt','Kein Plan berechenbar',(d.status||'SoC oder Zeitplan fehlt')+'. Sensoren, PV-Prognose und Datenalter prüfen.','timeline-action');return;}
       const endTime=d.charge_deadline||d.horizon_end;

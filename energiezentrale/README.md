@@ -1,7 +1,10 @@
-# Energiezentrale 1.2.39
+# Energiezentrale 1.2.40
 
 ## Tagesplanung, Verbraucherfenster und Sofar-Leistungsgrenze
 
+- Die rollierende Kandidatensuche vergleicht mögliche Verbraucher-Startzeiten und Heizstufen über den gesamten Horizont anhand von Netzbezug, Lastspitze, vermiedener Einspeisung und zusätzlichem Batteriebezug.
+- Mehr Messhistorie aktualisiert die gelernten PV- und Lastprofile; der Plan zeigt Anzahl Lerntage und geprüfter Varianten. Das ist ein lernender Schattenoptimierer, kein autonomer Regler.
+- Pro Verbraucher wird je Plan höchstens ein Startfenster vorgeschlagen. HA-Impulse und Abschaltung bleiben separat konfiguriert; zukünftige Befehle werden nicht vorgemerkt.
 - Erstellt einen 15-Minuten-Schattenplan bis zur Abend-Ladefrist oder durch die Nacht bis zum Morgen.
 - Zeigt Batteriestand, erwarteten Netzbezug nach der Hardware-Untergrenze, PV-Prognose und mögliche Verbraucherfenster samt angenommener Laufzeit.
 - Trennt die physische 20-%-BMS-Untergrenze von einer höheren strategischen Morgenreserve. Unterhalb der Hardware-Grenze übernimmt in der Vorschau das Netz direkt den Hausverbrauch; eine Reserve-Lücke löst keine Batterieladung aus dem Netz aus.
@@ -73,7 +76,7 @@ Home Assistant energy analysis and optional control add-on. Keeps prior overview
 Active control is opt-in and remains disabled by default. It supports one configured master control entity set that distributes identical per-inverter settings to a two-inverter master/slave pair. It requires verified grid-sensor polarity, fresh measurements in W and %, compatible Solax Modbus control entities, and a confirmed 5-minute watchdog configured to return to the previous mode. A control failure disables the setting and attempts to restore the saved mode; the inverter watchdog is the fallback. This assumes the master entity broadcasts its per-inverter setpoints to the slave, as confirmed for this installation. Failed state restoration, network interruptions and unknown firmware behavior must be reviewed in Home Assistant before enabling. Optional consumer start pulses can be sent to explicitly configured Home Assistant input buttons; the default is off. Energy estimates also depend on sensor mapping and history coverage.
 
 ## Validation
-Version 1.2.39 was checked with Python 3.14, Node, synthetic planner data, and local Flask page rendering. The live Home Assistant, Solcast attributes, and Sofar Modbus connection were not available for verification.
+Version 1.2.40 was checked with Python 3.14, Node, synthetic planner data, and local Flask page rendering. The live Home Assistant, Solcast attributes, and Sofar Modbus connection were not available for verification.
 
 
 Version 1.1.1: Netz- und Batteriesensor-Vorzeichen werden bei der Tagesenergiebilanz konfigurationsbasiert ausgewertet. Aktive Steuerung bleibt deaktiviert.
@@ -84,4 +87,5 @@ Version 1.1.1: Netz- und Batteriesensor-Vorzeichen werden bei der Tagesenergiebi
 - Der Mindestumfang ist über `settings.morning_min_samples_per_day` konfigurierbar (Standard: 60 Messpunkte).
 - Weiterhin reine Empfehlung; keine Steuerbefehle an Wechselrichter oder Verbraucher.
 - Prüfung: Python-Syntax und ZIP-Integrität; Laufzeittest in Home Assistant steht noch aus.
+
 
