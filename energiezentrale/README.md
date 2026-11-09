@@ -1,4 +1,4 @@
-# Energiezentrale 1.2.43
+# Energiezentrale 1.2.45
 
 ## Tagesplanung, Verbraucherfenster und Sofar-Leistungsgrenze
 
@@ -11,6 +11,7 @@
 - Trennt die physische 20-%-BMS-Untergrenze von einer höheren strategischen Morgenreserve. Unterhalb der Hardware-Grenze übernimmt in der Vorschau das Netz direkt den Hausverbrauch; eine Reserve-Lücke löst keine Batterieladung aus dem Netz aus.
 - Verbraucherstarts werden nur vorgeschlagen, wenn eine konservative Neuberechnung das Abendziel von mindestens 98,5 % SoC weiterhin erreicht.
 - Solcast-Zeitfensterattribute werden genutzt, wenn der HA-Sensor sie bereitstellt. Reine Tageswerte werden mit einem gelernten PV-Profil oder einer sichtbaren groben Tageskurve verteilt.
+- Bei mindestens drei Lerntagen vergleicht der Schattenplan die letzte Stunde gemessener PV mit dem lokalen 15-Minuten-Profil. Anhaltende Unterproduktion kürzt die verbleibende Solcast-Energieprognose vorsichtig; Nebel, Schnee, Verschattung und Messprobleme werden nicht voneinander unterschieden.
 - HA-Startimpulse erfordern weiterhin die globale und individuelle Freigabe, Gesamt-PCC-Bestätigung, eindeutigen AUS-Status, frische Livewerte und stabilen Überschuss. Bei nicht erreichbarem Speicherziel bleibt der Impuls gesperrt.
 - Bei zwei parallel geregelten Sofar-Wechselrichtern bleibt die Entlade-Leistungsgrenze bei 30 kW gesamt beziehungsweise −15 kW je Gerät gesetzt. Die physische Mindestgrenze muss im Wechselrichter/BMS übereinstimmend konfiguriert sein.
 - Die Übersicht enthält eine farbige Planansicht; schriftliche Energy-Brain-Erklärungen nennen jetzt die aktuellen Planwerte.
@@ -77,7 +78,7 @@ Home Assistant energy analysis and optional control add-on. Keeps prior overview
 Active control is opt-in and remains disabled by default. It supports one configured master control entity set that distributes identical per-inverter settings to a two-inverter master/slave pair. It requires verified grid-sensor polarity, fresh measurements in W and %, compatible Solax Modbus control entities, and a confirmed 5-minute watchdog configured to return to the previous mode. A control failure disables the setting and attempts to restore the saved mode; the inverter watchdog is the fallback. This assumes the master entity broadcasts its per-inverter setpoints to the slave, as confirmed for this installation. Failed state restoration, network interruptions and unknown firmware behavior must be reviewed in Home Assistant before enabling. Optional consumer start pulses can be sent to explicitly configured Home Assistant input buttons; the default is off. Energy estimates also depend on sensor mapping and history coverage.
 
 ## Validation
-Version 1.2.43 was checked with Node JavaScript syntax validation and a source review of the night forecast clamping logic. The live Home Assistant, Solcast attributes, and Sofar Modbus connection were not available for verification.
+Version 1.2.45 was checked with Python and JavaScript syntax validation. The live Home Assistant, Solcast sensor attributes and Sofar Modbus connection were not available for verification.
 
 
 Version 1.1.1: Netz- und Batteriesensor-Vorzeichen werden bei der Tagesenergiebilanz konfigurationsbasiert ausgewertet. Aktive Steuerung bleibt deaktiviert.

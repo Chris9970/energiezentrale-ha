@@ -1,5 +1,5 @@
 name: "Energiezentrale"
-version: "1.2.43"
+version: "1.2.45"
 slug: "energiezentrale"
 description: "Energiezentrale mit lokalem Lernsystem und optionaler, watchdog-gesicherter Sofar HYD Speicherregelung"
 arch: [aarch64, amd64]

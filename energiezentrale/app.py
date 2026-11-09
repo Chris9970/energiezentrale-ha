@@ -731,7 +731,9 @@ def consumers():
   if remove_id:
    c['consumers']=[x for x in c.get('consumers',[]) if str(x.get('id'))!=remove_id]
    save(c); flash('Verbraucher entfernt. Lernhistorie und übrige Einstellungen bleiben erhalten.','success')
-   return redirect(url_for('consumers'))
+   # Keep Home Assistant's ingress prefix in the browser URL. url_for() emits
+   # an absolute /consumers path, which escapes the ingress token and returns 404.
+   return redirect('consumers')
   ids=request.form.getlist('consumer_id')
   pulse_flags=request.form.getlist('consumer_pulse_enabled'); pulse_buttons=request.form.getlist('consumer_start_button'); pulse_powers=request.form.getlist('consumer_start_power')
   names=request.form.getlist('consumer_name'); types=request.form.getlist('consumer_type')
@@ -810,7 +812,8 @@ def consumers():
   c['settings']['consumer_dispatch_sustain_seconds']=num(request.form.get('consumer_dispatch_sustain_seconds','120'),120,30,900)
   c['settings']['consumer_dispatch_cooldown_minutes']=num(request.form.get('consumer_dispatch_cooldown_minutes','30'),30,5,360)
   save(c); flash('Verbraucher gespeichert. Impulse sind '+('global freigegeben' if c['settings']['consumer_dispatch_enabled'] else 'global ausgeschaltet')+'; jeder Verbraucher benötigt zusätzlich eine eigene Freigabe, input_button und Statussensor.','success')
-  return redirect(url_for('consumers'))
+  # Relative redirect preserves the Home Assistant ingress path after POST.
+  return redirect('consumers')
  return render_template('consumers.html',cfg=c)
 
 CONSUMER_DISPATCH_RUNTIME={'status':'Impulse ausgeschaltet','last_update':None,'consumers':[],'last_command':None}
@@ -1612,6 +1615,60 @@ def _day_ahead_profiles(c, rows, now):
     profile_days=len({day for day,_ in list(load_days.keys())+list(pv_days.keys())})
     return load_profile,pv_profile,consumer_profiles,profile_days
 
+def _pv_underperformance_feedback(rows, now):
+    """Conservatively detect sustained PV shortfall against the local time profile."""
+    result={'eligible':False,'applied':False,'factor':1.0,'actual_to_profile_ratio':None,
+            'coverage_minutes':0.0,'expected_kwh':0.0,'actual_kwh':0.0,'profile_days':0}
+    start=now-timedelta(minutes=60); points=[]
+    historical_by_day={}; history_start=now-timedelta(days=21)
+    for row in rows:
+        dt=_plan_timestamp(row.get('timestamp'))
+        if dt is None or dt<history_start or dt>now: continue
+        try:
+            pv=float((row.get('values') or {}).get('pv_power'))
+            if not math.isfinite(pv) or not 0<=pv<=250000: continue
+            if dt.date()==now.date():
+                if dt>=start: points.append((dt,pv))
+            else:
+                historical_by_day.setdefault((dt.date().isoformat(),dt.hour*4+dt.minute//15),[]).append(pv)
+        except (TypeError,ValueError): pass
+    points.sort(key=lambda item:item[0])
+    if not points or (now-points[-1][0]).total_seconds()>180:
+        return result
+    daily_profiles={}
+    for (day,slot),samples in historical_by_day.items():
+        daily_profiles.setdefault(slot,[]).append(statistics.median(samples))
+    pv_profile={slot:statistics.median(samples) for slot,samples in daily_profiles.items() if len(samples)>=3}
+    result['profile_days']=max((len(samples) for samples in daily_profiles.values()),default=0)
+    if not pv_profile: return result
+    actual_kwh=expected_kwh=covered_seconds=0.0
+    for (t0,p0),(t1,p1) in zip(points,points[1:]):
+        span=(t1-t0).total_seconds()
+        if not 5<=span<=120: continue
+        overlap_start=max(start,t0); overlap_end=min(now,t1)
+        seconds=max(0.0,(overlap_end-overlap_start).total_seconds())
+        if seconds<=0: continue
+        midpoint=overlap_start+(overlap_end-overlap_start)/2
+        slot=midpoint.hour*4+midpoint.minute//15
+        reference_w=pv_profile.get(slot)
+        if reference_w is None or reference_w<400: continue
+        actual_kwh+=max(0.0,(p0+p1)*0.5)*seconds/3600000.0
+        expected_kwh+=reference_w*seconds/3600000.0
+        covered_seconds+=seconds
+    result.update({'coverage_minutes':round(covered_seconds/60,1),
+                   'expected_kwh':round(expected_kwh,3),'actual_kwh':round(actual_kwh,3)})
+    if covered_seconds<20*60 or expected_kwh<0.4:
+        return result
+    ratio=max(0.0,actual_kwh/expected_kwh)
+    result.update({'eligible':True,'actual_to_profile_ratio':round(ratio,3)})
+    # Only derate, never boost, based on one day's recent output. A 15-point
+    # buffer softens ordinary cloud variation; the 25% floor avoids claiming
+    # that snow or sensor issues prove PV production is exactly zero.
+    if ratio<0.75:
+        result['factor']=round(max(0.25,min(1.0,ratio+0.15)),3)
+        result['applied']=True
+    return result
+
 def _solcast_interval_forecast(item, now, end):
     """Read Solcast-style per-period energy from HA sensor attributes when exposed."""
     attrs=(item or {}).get('attributes') or {}
@@ -1755,8 +1812,15 @@ def build_day_ahead_plan(c=None, rows=None, snap=None):
     forecast_kwh=(forecast_value/1000.0 if forecast_value is not None and 'wh' in forecast_unit and 'kwh' not in forecast_unit else forecast_value)
     if forecast_kwh is not None and forecast_kwh<0: forecast_kwh=None
     remaining_forecast=(max(0.0,forecast_kwh-today_pv_kwh) if st.get('pv_forecast_mode','daily_total')=='daily_total' else forecast_kwh) if forecast_kwh is not None else None
+    pv_feedback=(_pv_underperformance_feedback(rows,now)
+                 if phase=='pv_to_evening' else {'eligible':False,'applied':False,'factor':1.0,
+                 'actual_to_profile_ratio':None,'coverage_minutes':0.0,'expected_kwh':0.0,'actual_kwh':0.0})
+    if remaining_forecast is not None and pv_feedback['applied']:
+        remaining_forecast*=pv_feedback['factor']
     interval_forecast=_solcast_interval_forecast(forecast_item,now,end) if phase=='pv_to_evening' else {}
     forecast_source='Solcast-Zeitfenster' if interval_forecast else 'Tageswert, zeitlich verteilt'
+    if pv_feedback['applied']:
+        forecast_source+=f" · Ist-PV-Korrektur ×{pv_feedback['factor']:.2f}"
     pv_weights={}
     for dt,minutes in boundaries:
         slot=dt.hour*4+dt.minute//15
@@ -1849,6 +1913,11 @@ def build_day_ahead_plan(c=None, rows=None, snap=None):
             'peak_grid_w':max((x['grid_import_w'] for x in simulated),default=0.0),
         }
     current_sim=baseline; current_metrics=schedule_metrics(baseline)
+    if pv_feedback['applied']:
+        ratio_pct=round(float(pv_feedback['actual_to_profile_ratio'] or 0)*100)
+        notes.append(f"Die gemessene PV lag während {pv_feedback['coverage_minutes']:.0f} gut erfassten Minuten bei etwa {ratio_pct} % des gelernten Zeitprofils. Die verbleibende Solcast-Prognose wird vorsichtig mit Faktor {pv_feedback['factor']:.2f} angesetzt. Ursache lässt sich aus Leistung allein nicht unterscheiden (z. B. Nebel, Schnee, Verschattung oder Messproblem).")
+    elif phase=='pv_to_evening' and not pv_feedback['eligible'] and pv_feedback.get('profile_days',0)<3:
+        notes.append('Für den PV-Ist-Abgleich fehlen mindestens drei vorherige Mess-Tage mit Profilwerten zur aktuellen Uhrzeit; Solcast bleibt unkorrigiert.')
     if phase=='pv_to_evening' and charge_deadline:
         if remaining_forecast is None: notes.append('Kein aktueller PV-Prognosesensorwert; Verbraucherplanung bleibt gesperrt.')
         elif not full_reachable: notes.append('Die vorsichtige Batterie-only-Prognose erreicht bis zur Abendfrist keine volle Batterie; Speicher hat Vorrang, daher keine geplanten Zusatzverbraucher.')
@@ -1951,6 +2020,7 @@ def build_day_ahead_plan(c=None, rows=None, snap=None):
         'status':'Plan vorläufig' if remaining_forecast is None or profile_days<3 else '15-Minuten-Schattenplan',
         'forecast_source':forecast_source,'forecast_remaining_kwh':round(remaining_forecast,2) if remaining_forecast is not None else None,
         'forecast_safety_factor':0.80 if not interval_forecast and phase=='pv_to_evening' else 1.0,
+        'pv_underperformance_feedback':pv_feedback,
         'profile_days':profile_days,'load_profile_slots':len(load_profile),'pv_profile_slots':len(pv_profile),
         'battery_soc_percent':round(soc,1),'battery_soc_source':soc_source,
         'battery_soc_age_minutes':round(soc_age_seconds/60,1) if soc_age_seconds is not None else None,
@@ -2034,6 +2104,14 @@ def api_stage_optimizer():
             if 0<t1-t0<=120 and isinstance(p0,(int,float)) and isinstance(p1,(int,float)): today_pv_kwh+=max(0,(p0+p1)*0.5)*(t1-t0)/3600000
     except Exception: pass
     pv_remaining_kwh=(max(0.0,forecast_kwh-today_pv_kwh) if st.get('pv_forecast_mode','daily_total')=='daily_total' else forecast_kwh) if forecast_kwh is not None else None
+    pv_feedback={}
+    try:
+        day_plan=get_day_ahead_plan(snap)
+        if day_plan.get('phase')=='pv_to_evening' and day_plan.get('forecast_remaining_kwh') is not None:
+            pv_remaining_kwh=day_plan['forecast_remaining_kwh']
+            pv_feedback=day_plan.get('pv_underperformance_feedback') or {}
+    except Exception:
+        pv_feedback={}
     heaters=sorted((x for x in c.get('consumers',[]) if x.get('enabled') and x.get('type')=='heater'),key=lambda x:int(x.get('priority',99)))
     results=[]
     known_heater_w=0.0
@@ -2073,7 +2151,7 @@ def api_stage_optimizer():
                 else:
                     status='möglicher nächster Schritt'; reason=f'Schattenvorschlag: {current_stage} → {nxt} W für zunächst 15 Minuten prüfen. Batterie bleibt im Ladeplan vorrangig; noch kein Impuls.'
         results.append({'id':x.get('id'),'name':x.get('name','Heizung'),'current_power_w':round(current) if current is not None else None,'next_stage_w':nxt,'status':status,'reason':reason})
-    return jsonify({'timestamp':now.isoformat(),'mode':'Schattenmodus','commands_sent':False,'deadline':deadline.isoformat(),'hours_until_deadline':round(hours_left,2),'soc_percent':soc,'minimum_soc_percent':hard_min_soc,'battery_gap_kwh':round(battery_gap_kwh,2) if battery_gap_kwh is not None else None,'pv_forecast_remaining_kwh':round(pv_remaining_kwh,2) if pv_remaining_kwh is not None else None,'grid_export_w':round(export_w) if export_w is not None else None,'battery_charge_w':round(charge_w) if charge_w is not None else None,'consumers':results,'note':'Einzelprüfung für den nächsten Heizungs-Schritt. Der vollständige 15-Minuten-Ablauf steht unter /api/day-plan; beide Ansichten bleiben im Schattenmodus.'})
+    return jsonify({'timestamp':now.isoformat(),'mode':'Schattenmodus','commands_sent':False,'deadline':deadline.isoformat(),'hours_until_deadline':round(hours_left,2),'soc_percent':soc,'minimum_soc_percent':hard_min_soc,'battery_gap_kwh':round(battery_gap_kwh,2) if battery_gap_kwh is not None else None,'pv_forecast_remaining_kwh':round(pv_remaining_kwh,2) if pv_remaining_kwh is not None else None,'pv_underperformance_feedback':pv_feedback,'grid_export_w':round(export_w) if export_w is not None else None,'battery_charge_w':round(charge_w) if charge_w is not None else None,'consumers':results,'note':'Einzelprüfung für den nächsten Heizungs-Schritt. Verwendet dieselbe vorsichtige PV-Ist-Korrektur wie der Tagesplan. Es werden keine Befehle gesendet.'})
 
 @app.route('/api/compressor-analysis')
 def api_compressor_analysis():
