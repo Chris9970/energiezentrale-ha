@@ -2723,8 +2723,9 @@ def api_night_plan():
             remaining_night_discharge_kwh+=energy
             if reserve_crossing_time is None and reserve_kwh is not None and forecast_energy<=reserve_kwh:
                 reserve_crossing_time=slot_end
+            effective_discharge_w=(min(float(item['median_w']),energy*1000.0/hours) if hours>0 else 0.0)
             night_forecast_slots.append({'time':item['time'],'slot_end':slot_end.isoformat(),
-                'expected_discharge_w':round(item['median_w']),'expected_energy_kwh':round(energy,3),
+                'expected_discharge_w':round(effective_discharge_w),'expected_energy_kwh':round(energy,3),
                 'expected_soc_after_percent':round(forecast_energy/capacity*100,1) if capacity>0 else None,
                 'days_seen':item['days_seen']})
     estimated_night_end_kwh = (max(hard_floor_kwh,current_kwh-remaining_night_discharge_kwh) if current_kwh is not None and current_kwh>=hard_floor_kwh else current_kwh) if current_kwh is not None and discharge_slots and night_profile_coverage>=0.70 else None

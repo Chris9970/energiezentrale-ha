@@ -60,7 +60,7 @@
       const morning=d.morning_start_label||('Morgen '+(d.morning_start||'05:00'));
       if(d.night_start_label)addTimeline(timeline,d.night_start_label,'Gelernter Nachtplan startet','Ab hier wird die typische Entladung aus historischen 15-Minuten-Zeitfenstern geschätzt.');
       (d.night_forecast_slots||[]).filter((x,i,a)=>x.time.endsWith(':00')||i===a.length-1).forEach(x=>{
-        if(x.expected_soc_after_percent!==null)addTimeline(timeline,x.time,'Prognose · '+fmt(x.expected_soc_after_percent,1)+' % SoC',fmt(x.expected_discharge_w,0)+' W typische Entladung · '+x.days_seen+' Messtage.');
+        if(x.expected_soc_after_percent!==null)addTimeline(timeline,x.time,'Prognose · '+fmt(x.expected_soc_after_percent,1)+' % SoC',fmt(x.expected_discharge_w,0)+' W prognostizierte Batterieentladung · '+x.days_seen+' Messtage.');
       });
       if(d.estimated_battery_soc_at_morning_percent!==null&&d.estimated_battery_soc_at_morning_percent!==undefined){
         addTimeline(timeline,'bis '+morning,'Erwarteter Morgenstand '+fmt(d.estimated_battery_soc_at_morning_percent,1)+' %',
